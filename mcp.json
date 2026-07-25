@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "clangq": {
+      "command": "python3",
+      "args": [
+        "<workspace_folder>/clangq_mcp.py"
+      ],
+      "env": {
+        // "PYTHONPATH": "<absolute_path_to_python_packages>"
+      },
+      "disabled": false,
+      "alwaysAllow": [
+        "get_function_info",
+        "get_class_info",
+        "get_macro_info",
+        "get_outgoing_calls",
+        "get_incoming_calls",
+        "get_diagnostics",
+        "get_hover_info",
+        "get_type_hierarchy"
+      ]
+    }
+  }
+}
