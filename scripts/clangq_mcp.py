@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
@@ -17,12 +18,17 @@ server = Server("clangq")
 
 # keep warm clients per root -- avoids re-indexing on every call
 _clients = {}
+_clients_lock = threading.Lock()
 
 def get_client(root):
-    if root not in _clients:
-        _clients[root] = ClangdClient(root).start()
-        _clients[root].prime_index()
-    return _clients[root]
+    # Query calls run in worker threads (see call_tool below), so two
+    # concurrent first-time calls for the same root could otherwise race
+    # and start two daemons for it.
+    with _clients_lock:
+        if root not in _clients:
+            _clients[root] = ClangdClient(root).start()
+            _clients[root].prime_index()
+        return _clients[root]
 
 @server.list_tools()
 async def list_tools():
@@ -186,20 +192,25 @@ async def list_tools():
         ),
     ]
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict):
+def _run_tool(name: str, arguments: dict):
+    """The actual (blocking) query work. Runs in a worker thread via
+    asyncio.to_thread (see call_tool below) so the event loop stays free to
+    accept and dispatch other concurrent tool calls instead of blocking on
+    this one's clangd round-trips -- ClangdClient's request dispatch is
+    already thread-safe (that's what the pipelined class-query relies on),
+    so multiple tool calls can share the same warm daemon concurrently."""
     root = arguments.get("root")
     if not root:
-        return [types.TextContent(type="text", text="Error: root path is required")]
+        return "Error: root path is required"
 
     try:
         client = get_client(root)
     except Exception as e:
-        return [types.TextContent(type="text", text="Error starting clangd: %s" % e)]
+        return "Error starting clangd: %s" % e
 
     try:
         if name == "get_function_info":
-            result = run_query_as_string(
+            return run_query_as_string(
                 client,
                 arguments.get("mode", "all"),
                 arguments["name"],
@@ -207,7 +218,7 @@ async def call_tool(name: str, arguments: dict):
             )
 
         elif name == "get_class_info":
-            result = run_class_query_as_string(
+            return run_class_query_as_string(
                 client,
                 arguments.get("mode", "all"),
                 arguments["name"],
@@ -215,7 +226,7 @@ async def call_tool(name: str, arguments: dict):
             )
 
         elif name == "get_macro_info":
-            result = run_macro_query_as_string(
+            return run_macro_query_as_string(
                 client,
                 arguments.get("mode", "all"),
                 arguments["name"],
@@ -223,7 +234,7 @@ async def call_tool(name: str, arguments: dict):
             )
 
         elif name == "get_struct_info":
-            result = run_struct_query_as_string(
+            return run_struct_query_as_string(
                 client,
                 arguments["name"],
                 120,
@@ -231,7 +242,7 @@ async def call_tool(name: str, arguments: dict):
             )
 
         elif name == "get_hover_info":
-            result = run_hover_query_as_string(
+            return run_hover_query_as_string(
                 client,
                 arguments["path"],
                 arguments["line"],
@@ -240,18 +251,21 @@ async def call_tool(name: str, arguments: dict):
             )
 
         elif name == "get_incoming_calls":
-            result = run_incoming_calls_query_as_string(
+            return run_incoming_calls_query_as_string(
                 client,
                 arguments["name"],
                 120
             )
 
         else:
-            result = "Unknown tool: %s" % name
+            return "Unknown tool: %s" % name
 
     except Exception as e:
-        result = "Error running query: %s" % e
+        return "Error running query: %s" % e
 
+@server.call_tool()
+async def call_tool(name: str, arguments: dict):
+    result = await asyncio.to_thread(_run_tool, name, arguments)
     return [types.TextContent(type="text", text=result)]
 
 async def main():
