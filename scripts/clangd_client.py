@@ -176,6 +176,7 @@ class ClangdClient:
                 "textDocument": {
                     "references": {},
                     "callHierarchy": {"dynamicRegistration": False},
+                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
                 },
                 "window": {"workDoneProgress": True},
             },
@@ -238,31 +239,73 @@ class ClangdClient:
             "position": {"line": line, "character": col},
         })
 
+    def definition(self, path, line, col):
+        uri = self.did_open(path)
+        return self._request("textDocument/definition", {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+        })
+
     def document_symbol(self, path):
         uri = self.did_open(path)
         return self._request("textDocument/documentSymbol", {
             "textDocument": {"uri": uri},
         }) or []
 
+    def _find_node_by_range_start(self, nodes, start_line):
+        """Recursively search a hierarchical DocumentSymbol[] tree for the
+        node whose full range starts at start_line (top-level or nested,
+        e.g. a method inside a class)."""
+        for n in nodes:
+            if (n.get("range") or {}).get("start", {}).get("line") == start_line:
+                return n
+            found = self._find_node_by_range_start(n.get("children") or [], start_line)
+            if found is not None:
+                return found
+        return None
+
     def get_class_methods(self, path, class_start, class_end):
         symbols = self.document_symbol(path)
-        return self._find_class_methods(symbols, class_start, class_end)
+        return self._find_class_methods(symbols, class_start)
 
-    def _find_class_methods(self, symbols, class_start, class_end):
-        # print(f"DEBUG Symbols: {symbols}")
-        return [
-            s for s in symbols
-            if class_start <= s.get("location", {}).get("range", {}).get("start", {}).get("line", -1) < class_end
-            and s.get("kind") in (6, 12)  # Method or Function
-        ]
+    def _find_class_methods(self, symbols, class_start):
+        class_node = self._find_node_by_range_start(symbols, class_start)
+        if class_node is None:
+            return []
+        out = []
+        for child in class_node.get("children") or []:
+            if child.get("kind") not in (6, 12):  # Method or Function
+                continue
+            # selectionRange is the identifier token itself; range is the
+            # whole declaration (from the return type). Definition/reference
+            # lookups need a position on the identifier, so use selectionRange.
+            sel = child.get("selectionRange") or child.get("range") or {}
+            rng = child.get("range") or {}
+            out.append({
+                "name": child.get("name"),
+                "start_line": sel.get("start", {}).get("line", 0),
+                "start_col": sel.get("start", {}).get("character", 0),
+                "end_line": rng.get("end", {}).get("line", sel.get("start", {}).get("line", 0)),
+            })
+        return out
+
+    def get_class_end_and_methods(self, path, class_start):
+        """Single documentSymbol fetch for both the class end line and its
+        methods, instead of two separate calls that each re-fetch the same
+        document symbol tree."""
+        symbols = self.document_symbol(path)
+        class_node = self._find_node_by_range_start(symbols, class_start)
+        if class_node is None:
+            return None, []
+        end_line = (class_node.get("range") or {}).get("end", {}).get("line")
+        return end_line, self._find_class_methods(symbols, class_start)
 
     def get_function_end_line(self, path, start_line):
         symbols = self.document_symbol(path)
-        #print(f"DEBUG Symbols: {symbols}")
-        for sym in symbols:
-            if sym.get("location", {}).get("range", {}).get("start", {}).get("line") == start_line:
-                return sym.get("location", {}).get("range", {}).get("end", {}).get("line")
-        return None
+        node = self._find_node_by_range_start(symbols, start_line)
+        if node is None:
+            return None
+        return (node.get("range") or {}).get("end", {}).get("line")
 
     def workspace_symbol(self, query):
         """Resolve a name via clangd's own index. Returns SymbolInformation[]."""
