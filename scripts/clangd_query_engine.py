@@ -45,13 +45,15 @@ def uri_to_path(uri):
         return p
 
 def loc_str(loc):
-    line = loc.get("range", {}).get("start", {}).get("line", 0) + 1
+    line = (((loc.get("range") or {}).get("start") or {}).get("line") or 0) + 1
     return "%s:%d" % (uri_to_path(loc.get("uri", "")), line)
 
 def item_str(item):
     return "%-30s %s" % (item.get("name", "?"), loc_str(item))
 
 def pick_symbol_kind(symbols, name, kind):
+    if not symbols:
+        return None
     exact = [s for s in symbols if s.get("name") == name and s.get("kind") == kind]
     return (exact or symbols)[0]
 
@@ -88,24 +90,39 @@ def resolve_position(client, name, wait, verbose):
     # on either -- same fire-then-collect pattern used for
     # class queries, just applied here even for the common single-candidate
     # case, since there's no reason those two round-trips should be serial.
+    # One unopenable candidate path (a stale index entry, a generated file
+    # that no longer exists) shouldn't sink the whole query -- skip it and
+    # keep the candidates that do resolve.
+    usable = []
     for it in items:
-        it["doc_handle"] = client.document_symbol_async(it["path"])
-        it["decl_handle"] = client.declaration_async(it["path"], it["line"], it["col"])
+        try:
+            it["doc_handle"] = client.document_symbol_async(it["path"])
+            it["decl_handle"] = client.declaration_async(it["path"], it["line"], it["col"])
+        except Exception as e:
+            if verbose:
+                sys.stderr.write("note: skipping %s (%s)\n" % (it["path"], e))
+            continue
+        usable.append(it)
 
     results = []
-    for it in items:
+    for it in usable:
         try:
             doc_symbols = client.wait_result(it["doc_handle"])
         except Exception:
             doc_symbols = []
         end = client.end_line_from_document_symbol(doc_symbols, it["line"])
+        if end is None:
+            end = it["line"]
 
         try:
             decl = client.wait_result(it["decl_handle"])
         except Exception:
             decl = None
         decl_path = uri_to_path(decl[0].get("uri", "")) if decl else ""
-        decl_line = decl[0].get("range", {}).get("start", {}).get("line", 0) if decl else 0
+        decl_line = 0
+        if decl:
+            decl_start = (decl[0].get("range") or {}).get("start") or {}
+            decl_line = decl_start.get("line") or 0
 
         results.append((it["path"], it["line"], it["col"], end, decl_path, decl_line))
 
@@ -127,9 +144,13 @@ def run_class_query(client, mode, name, wait, include_decl=False, verbose=False,
 
     loc = sym.get("location") or {}
     path = uri_to_path(loc.get("uri", ""))
-    start_line = (loc.get("range") or {}).get("start", {}).get("line", 0)
+    start_line = ((loc.get("range") or {}).get("start") or {}).get("line") or 0
     # Single documentSymbol fetch covers both the class end line and its methods
-    end_line, methods = client.get_class_end_and_methods(path, start_line)
+    try:
+        end_line, methods = client.get_class_end_and_methods(path, start_line)
+    except Exception as e:
+        print("  documentSymbol failed for %s (%s)" % (path, e), file=out)
+        end_line, methods = None, []
     if end_line is None:
         end_line = start_line
     print("# %s (class decl %s:%d-%d)" % (name, path, start_line+1, end_line+1), file=out)
@@ -152,7 +173,7 @@ def run_class_query(client, mode, name, wait, include_decl=False, verbose=False,
     # clangd can work on many read-only queries concurrently, so each phase
     # below fires every method's request before waiting on any of them.
     items = [{
-        "method_name": name + "::" + method.get("name"),
+        "method_name": name + "::" + (method.get("name") or "<unnamed>"),
         "decl_path": path,  # methods are children of the class, same file
         "decl_line": method.get("start_line", 0),
         "decl_col": method.get("start_col", 0),
@@ -161,23 +182,28 @@ def run_class_query(client, mode, name, wait, include_decl=False, verbose=False,
 
     # Phase 1: definition() for every method.
     for it in items:
-        it["def_handle"] = client.definition_async(it["decl_path"], it["decl_line"], it["decl_col"])
+        try:
+            it["def_handle"] = client.definition_async(it["decl_path"], it["decl_line"], it["decl_col"])
+        except Exception:
+            pass
     for it in items:
         try:
-            defs = client.wait_result(it["def_handle"])
+            defs = client.wait_result(it["def_handle"]) if "def_handle" in it else None
         except Exception:
             defs = None
         if defs:
             d0 = defs[0]
             def_range = d0.get("range") or {}
+            def_start = def_range.get("start") or {}
+            def_end = def_range.get("end") or {}
             it["def_path"] = uri_to_path(d0.get("uri", "")) or it["decl_path"]
-            it["def_line"] = def_range.get("start", {}).get("line", it["decl_line"])
-            it["def_col"] = def_range.get("start", {}).get("character", it["decl_col"])
+            it["def_line"] = def_start.get("line", it["decl_line"])
+            it["def_col"] = def_start.get("character", it["decl_col"])
             # textDocument/definition's own range is often just the identifier's
             # line, not the whole body -- fall back to that for now, refined
             # below with the full documentSymbol extent (same "end" semantics
             # as a plain get_function_info query).
-            it["def_end"] = def_range.get("end", {}).get("line", it["def_line"])
+            it["def_end"] = def_end.get("line", it["def_line"])
         else:
             # No separate body found (e.g. pure virtual): fall back to the
             # declaration itself so callers still get something.
@@ -192,7 +218,11 @@ def run_class_query(client, mode, name, wait, include_decl=False, verbose=False,
     doc_handles = {}
     for it in items:
         if it["def_path"] not in doc_handles:
-            doc_handles[it["def_path"]] = client.document_symbol_async(it["def_path"])
+            try:
+                doc_handles[it["def_path"]] = client.document_symbol_async(it["def_path"])
+            except Exception:
+                # def_end just stays at the coarser definition-range value
+                pass
     doc_symbols = {}
     for def_path, handle in doc_handles.items():
         try:
@@ -280,7 +310,7 @@ def run_query(client, mode, name, wait, include_decl=False, verbose=False, out=N
     except Exception as e:
         print("  resolve failed for %r (%s)" % (name, e), file=out)
         return
-    if pos is None:
+    if not pos:
         print("  no symbol matching %r (raise --wait, or check --ccdir)" % name, file=out)
         return
 

@@ -1,4 +1,5 @@
 import asyncio
+import sys
 import threading
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -18,17 +19,37 @@ server = Server("clangq")
 
 # keep warm clients per root -- avoids re-indexing on every call
 _clients = {}
+_client_locks = {}
 _clients_lock = threading.Lock()
+
+def _lock_for(root):
+    with _clients_lock:
+        if root not in _client_locks:
+            _client_locks[root] = threading.Lock()
+        return _client_locks[root]
 
 def get_client(root):
     # Query calls run in worker threads (see call_tool below), so two
     # concurrent first-time calls for the same root could otherwise race
-    # and start two daemons for it.
-    with _clients_lock:
-        if root not in _clients:
-            _clients[root] = ClangdClient(root).start()
-            _clients[root].prime_index()
-        return _clients[root]
+    # and start two daemons for it. The lock is per-root rather than
+    # global so a slow cold start for one repo doesn't block queries
+    # against an already-warm different repo.
+    with _lock_for(root):
+        client = _clients.get(root)
+        # A warm client whose clangd has since died would fail every
+        # request forever, so drop it and start a fresh one.
+        if client is not None and not client.is_alive():
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+            del _clients[root]
+            client = None
+        if client is None:
+            client = ClangdClient(root).start()
+            client.prime_index()
+            _clients[root] = client
+        return client
 
 @server.list_tools()
 async def list_tools():
@@ -208,60 +229,59 @@ def _run_tool(name: str, arguments: dict):
     except Exception as e:
         return "Error starting clangd: %s" % e
 
+    # A missing compile_commands.json isn't an exception -- clangd starts
+    # fine, it just has nothing to index, so every query below will quietly
+    # come back empty forever. Callers have no other way to tell "no
+    # matches" apart from "no index", so say so up front.
+    warning = ""
+    if not client._db_found:
+        warning = (
+            "# Warning: no compile_commands.json found under %r (checked "
+            "that path and its build/ subdir) -- clangd has no index, so "
+            "results below are likely empty regardless of the query.\n\n"
+            % root
+        )
+
     try:
-        if name == "get_function_info":
-            return run_query_as_string(
-                client,
-                arguments.get("mode", "all"),
-                arguments["name"],
-                120
-            )
+        if name in ("get_function_info", "get_class_info", "get_macro_info", "get_incoming_calls"):
+            sym_name = arguments.get("name")
+            if not sym_name:
+                return warning + "Error: name is required"
 
-        elif name == "get_class_info":
-            return run_class_query_as_string(
-                client,
-                arguments.get("mode", "all"),
-                arguments["name"],
-                120
-            )
-
-        elif name == "get_macro_info":
-            return run_macro_query_as_string(
-                client,
-                arguments.get("mode", "all"),
-                arguments["name"],
-                120
-            )
+            if name == "get_function_info":
+                result = run_query_as_string(client, arguments.get("mode", "all"), sym_name, 120)
+            elif name == "get_class_info":
+                result = run_class_query_as_string(client, arguments.get("mode", "all"), sym_name, 120)
+            elif name == "get_macro_info":
+                result = run_macro_query_as_string(client, arguments.get("mode", "all"), sym_name, 120)
+            else:  # get_incoming_calls
+                result = run_incoming_calls_query_as_string(client, sym_name, 120)
 
         elif name == "get_struct_info":
-            return run_struct_query_as_string(
-                client,
-                arguments["name"],
-                120,
-                include_decl=arguments.get("include_decl", False)
+            sym_name = arguments.get("name")
+            if not sym_name:
+                return warning + "Error: name is required"
+            result = run_struct_query_as_string(
+                client, sym_name, 120, include_decl=arguments.get("include_decl", False)
             )
 
         elif name == "get_hover_info":
-            return run_hover_query_as_string(
-                client,
-                arguments["path"],
-                arguments["line"],
-                arguments["col"],
-                wait=10
-            )
-
-        elif name == "get_incoming_calls":
-            return run_incoming_calls_query_as_string(
-                client,
-                arguments["name"],
-                120
-            )
+            path = arguments.get("path")
+            line = arguments.get("line")
+            col = arguments.get("col")
+            if not path:
+                return warning + "Error: path is required"
+            if not isinstance(line, int) or not isinstance(col, int):
+                return warning + "Error: line and col must be integers (got line=%r, col=%r)" % (line, col)
+            result = run_hover_query_as_string(client, path, line, col, wait=10)
 
         else:
-            return "Unknown tool: %s" % name
+            return warning + "Unknown tool: %s" % name
+
+        return warning + result
 
     except Exception as e:
-        return "Error running query: %s" % e
+        return warning + "Error running query: %s" % e
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
@@ -269,8 +289,14 @@ async def call_tool(name: str, arguments: dict):
     return [types.TextContent(type="text", text=result)]
 
 async def main():
-    async with stdio_server() as (read, write):
-        await server.run(read, write, server.create_initialization_options())
+    try:
+        async with stdio_server() as (read, write):
+            await server.run(read, write, server.create_initialization_options())
+    except Exception as e:
+        print("clangq_mcp main() crashed: %s" % e, file=sys.stderr)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print("clangq_mcp asyncio.run() crashed: %s" % e, file=sys.stderr)

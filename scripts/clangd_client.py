@@ -70,7 +70,15 @@ class ClangdClient:
         holder = {}
         with self._pending_lock:
             self._pending[rid] = (ev, holder)
-        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        try:
+            self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        except Exception as e:
+            # clangd likely died -- drop the pending entry instead of leaking
+            # it (it will never get a reply), and fail fast with a clear
+            # error instead of the raw OSError/BrokenPipeError.
+            with self._pending_lock:
+                self._pending.pop(rid, None)
+            raise RuntimeError("failed to send %s to clangd (process may have exited): %s" % (method, e))
         return (ev, holder, method)
 
     def wait_result(self, handle, timeout=None):
@@ -111,7 +119,13 @@ class ClangdClient:
             if ":" in line:
                 k, v = line.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
-        length = int(headers["content-length"])
+        raw_len = headers.get("content-length")
+        if raw_len is None:
+            raise RuntimeError("clangd sent a message with no Content-Length header")
+        try:
+            length = int(raw_len)
+        except ValueError:
+            raise RuntimeError("clangd sent a bad Content-Length: %r" % raw_len)
         body = self._read_exactly(length)
         if body is None:
             return None
@@ -137,6 +151,8 @@ class ClangdClient:
                     rc = self.proc.poll()
                     reason = "clangd exited (code %s)" % rc if rc is not None else "clangd stream closed"
                     break
+                if not isinstance(msg, dict):
+                    continue
                 if "id" in msg and ("result" in msg or "error" in msg):
                     with self._pending_lock:
                         entry = self._pending.pop(msg["id"], None)
@@ -157,7 +173,7 @@ class ClangdClient:
                     if self.log:
                         sys.stderr.write("[clangd] %s %s\n" % (val.get("kind"), val.get("title", "")))
                 elif method == "window/logMessage" and self.log:
-                    sys.stderr.write("[clangd] " + msg["params"].get("message", "") + "\n")
+                    sys.stderr.write("[clangd] " + (msg.get("params") or {}).get("message", "") + "\n")
         except Exception as e:
             reason = "reader error: %r" % e
         finally:
@@ -193,6 +209,13 @@ class ClangdClient:
         self._notify("initialized", {})
         return self
 
+    def is_alive(self):
+        """Whether the clangd subprocess is still running. Callers that keep
+        a client warm across requests (e.g. the MCP server) should check
+        this before reuse -- once clangd exits, every further request would
+        otherwise fail with the same broken-pipe/timeout error forever."""
+        return self.proc is not None and self.proc.poll() is None
+
     def _uri(self, path):
         return pathlib.Path(path).resolve().as_uri()
 
@@ -200,8 +223,15 @@ class ClangdClient:
         uri = self._uri(path)
         if uri in self._opened:
             return uri
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read()
+        # Every query entry point funnels through here, so a bad path
+        # (typo, stale location from the index, a directory) would
+        # otherwise surface as a bare OSError with no indication of which
+        # file or which query caused it.
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            raise RuntimeError("cannot open source file %r: %s" % (path, e))
         self._notify("textDocument/didOpen", {
             "textDocument": {"uri": uri, "languageId": "cpp", "version": 1, "text": text},
         })
@@ -222,16 +252,29 @@ class ClangdClient:
             if self.log:
                 sys.stderr.write("[clangq] could not read compile DB: %r\n" % e)
             return None
+        if not isinstance(entries, list):
+            if self.log:
+                sys.stderr.write("[clangq] compile DB is not a JSON array: %s\n" % self._db_path)
+            return None
         for ent in entries:
+            if not isinstance(ent, dict):
+                continue
             fpath = ent.get("file")
             if not fpath:
                 continue
             if not os.path.isabs(fpath):
-                fpath = os.path.normpath(os.path.join(ent.get("directory", self.root), fpath))
+                fpath = os.path.normpath(os.path.join(ent.get("directory") or self.root, fpath))
             if os.path.exists(fpath):
                 if self.log:
                     sys.stderr.write("[clangq] priming index by opening %s\n" % fpath)
-                self.did_open(fpath)
+                # Priming is best-effort: one unreadable entry shouldn't
+                # abort startup, since a later entry may well open fine.
+                try:
+                    self.did_open(fpath)
+                except Exception as e:
+                    if self.log:
+                        sys.stderr.write("[clangq] could not prime with %s (%s)\n" % (fpath, e))
+                    continue
                 return fpath
         if self.log:
             sys.stderr.write("[clangq] no openable source file found in compile DB\n")
@@ -269,7 +312,9 @@ class ClangdClient:
         node whose full range starts at start_line (top-level or nested,
         e.g. a method inside a class)."""
         for n in nodes:
-            if (n.get("range") or {}).get("start", {}).get("line") == start_line:
+            if not isinstance(n, dict):
+                continue
+            if ((n.get("range") or {}).get("start") or {}).get("line") == start_line:
                 return n
             found = self._find_node_by_range_start(n.get("children") or [], start_line)
             if found is not None:
@@ -289,11 +334,14 @@ class ClangdClient:
             # lookups need a position on the identifier, so use selectionRange.
             sel = child.get("selectionRange") or child.get("range") or {}
             rng = child.get("range") or {}
+            sel_start = sel.get("start") or {}
+            rng_end = rng.get("end") or {}
+            start_line = sel_start.get("line") or 0
             out.append({
                 "name": child.get("name"),
-                "start_line": sel.get("start", {}).get("line", 0),
-                "start_col": sel.get("start", {}).get("character", 0),
-                "end_line": rng.get("end", {}).get("line", sel.get("start", {}).get("line", 0)),
+                "start_line": start_line,
+                "start_col": sel_start.get("character") or 0,
+                "end_line": rng_end.get("line", start_line),
             })
         return out
 
@@ -305,7 +353,7 @@ class ClangdClient:
         class_node = self._find_node_by_range_start(symbols, class_start)
         if class_node is None:
             return None, []
-        end_line = (class_node.get("range") or {}).get("end", {}).get("line")
+        end_line = ((class_node.get("range") or {}).get("end") or {}).get("line")
         return end_line, self._find_class_methods(symbols, class_start)
 
     def end_line_from_document_symbol(self, symbols, start_line):
@@ -315,7 +363,7 @@ class ClangdClient:
         node = self._find_node_by_range_start(symbols or [], start_line)
         if node is None:
             return None
-        return (node.get("range") or {}).get("end", {}).get("line")
+        return ((node.get("range") or {}).get("end") or {}).get("line")
 
     def workspace_symbol(self, query):
         """Resolve a name via clangd's own index. Returns SymbolInformation[]."""
