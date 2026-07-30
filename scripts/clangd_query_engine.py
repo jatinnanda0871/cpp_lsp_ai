@@ -37,6 +37,8 @@ from clangd_client import ClangdClient
 # ============================= formatting helpers =============================
 def uri_to_path(uri):
     p = unquote(urlparse(uri).path)
+    if os.name == "nt" and len(p) >= 3 and p[0] == "/" and p[2] == ":":
+        p = p[1:]  # file:///C:/... -> C:/... (urlparse leaves the leading slash)
     try:
         return os.path.relpath(p)
     except Exception:
@@ -141,22 +143,60 @@ def run_class_query(client, mode, name, wait, include_decl=False, verbose=False,
     loc = sym.get("location") or {}
     path = uri_to_path(loc.get("uri", ""))
     start_line = (loc.get("range") or {}).get("start", {}).get("line", 0)
-    # Get class end line from documentSymbol
-    end_line = client.get_function_end_line(path, start_line)
+    # Single documentSymbol fetch covers both the class end line and its methods
+    end_line, methods = client.get_class_end_and_methods(path, start_line)
+    if end_line is None:
+        end_line = start_line
     print("# %s (class decl %s:%d-%d)" % (name, path, start_line+1, end_line+1), file=out)
 
-    # Get all methods from class children
-    methods = client.get_class_methods(path, start_line, end_line)
     if not methods:
         print("  no methods found in class %r" % name, file=out)
         return
 
-    # For each class method, run existing function query
+    # Each method's identifier position is already known from the class's
+    # own child symbols above (fetched once, via documentSymbol's
+    # selectionRange -- the identifier token itself, not the whole
+    # declaration span). For classes declared in a header with bodies
+    # out-of-line in a .cpp, that position is the declaration only -- it has
+    # no body, so anchoring refs/callers there directly would make
+    # prepareCallHierarchy come back empty. Ask clangd for the definition
+    # from that known position instead: one deterministic LSP call, no
+    # fuzzy workspace/symbol search on the qualified "Class::method" string
+    # (which is what caused the retry-sleep latency previously -- clangd's
+    # fuzzy index matches unqualified names and often misses a
+    # "::"-qualified query on the first poll).
     for method in methods:
         method_name = name + "::" + method.get("name")
         print("\n--- Class Method: %s ---" % method_name, file=out)
         try:
-            run_query(client, mode, method_name, wait, include_decl, verbose, out)
+            decl_path = path  # methods are children of the class, same file
+            decl_line = method.get("start_line", 0)
+            decl_col = method.get("start_col", 0)
+
+            try:
+                defs = client.definition(decl_path, decl_line, decl_col)
+            except Exception:
+                defs = None
+            if defs:
+                d0 = defs[0]
+                def_path = uri_to_path(d0.get("uri", "")) or decl_path
+                def_range = d0.get("range") or {}
+                def_line = def_range.get("start", {}).get("line", decl_line)
+                def_col = def_range.get("start", {}).get("character", decl_col)
+                def_end = def_range.get("end", {}).get("line", def_line)
+            else:
+                # No separate body found (e.g. pure virtual): fall back to
+                # the declaration itself so callers still get something.
+                def_path, def_line, def_col = decl_path, decl_line, decl_col
+                def_end = method.get("end_line", decl_line)
+
+            print("# %s  (def %s:%d-%d)" % (method_name, def_path, def_line + 1, def_end + 1), file=out)
+            print("# %s  (decl %s:%d)" % (method_name, decl_path, decl_line + 1), file=out)
+            if mode in ("refs", "all"):
+                show_refs(client, method_name, def_path, def_line, def_col, include_decl, out)
+            if mode in ("callers", "all"):
+                show_calls(client, method_name, def_path, def_line, def_col, "callers", out)
+            print("", file=out)
         except Exception as e:
             print("  failed for %s (%s)" % (method_name, e), file=out)
 
