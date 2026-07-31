@@ -1,6 +1,17 @@
+#!/usr/bin/python3
+"""MCP server exposing the clangq semantic queries as assistant tools.
+
+Tools are declared once in TOOLS. A tool's Param list drives both the JSON
+schema sent to the host and the validation of incoming calls, so the two
+cannot drift apart.
+
+    call_tool -> asyncio.to_thread -> _run_tool -> handler -> query engine
+"""
 import asyncio
+import os
 import sys
 import threading
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
@@ -15,29 +26,45 @@ from clangd_query_engine import (
     run_incoming_calls_query_as_string,
 )
 
+# ============================ tunables ============================
+# Budget for a cold index on a large repo. ClangdClient cuts this short once
+# the index is serving, so a typo doesn't cost the full 120s.
+QUERY_WAIT_S = 120
+
+# Hover reads the open file's AST, no index needed.
+HOVER_WAIT_S = 10
+
+VALID_MODES = ("refs", "callers", "all")
+
 server = Server("clangq")
 
-# keep warm clients per root -- avoids re-indexing on every call
+
+# ======================= warm clangd per repo root =======================
+# Indexing is the expensive part, so one client stays alive per root.
 _clients = {}
 _client_locks = {}
 _clients_lock = threading.Lock()
 
+
 def _lock_for(root):
+    """Startup lock for one root. Per-root, so a cold start for one repo
+    doesn't block queries against an already-warm one."""
     with _clients_lock:
         if root not in _client_locks:
             _client_locks[root] = threading.Lock()
         return _client_locks[root]
 
+
 def get_client(root):
-    # Query calls run in worker threads (see call_tool below), so two
-    # concurrent first-time calls for the same root could otherwise race
-    # and start two daemons for it. The lock is per-root rather than
-    # global so a slow cold start for one repo doesn't block queries
-    # against an already-warm different repo.
+    """The warm client for `root`, started or replaced as needed.
+
+    Locked because tool calls run in worker threads: two concurrent
+    first-time calls would otherwise start two clangd processes.
+    """
     with _lock_for(root):
         client = _clients.get(root)
-        # A warm client whose clangd has since died would fail every
-        # request forever, so drop it and start a fresh one.
+
+        # A dead clangd would fail every later request, so retire it.
         if client is not None and not client.is_alive():
             try:
                 client.shutdown()
@@ -45,246 +72,329 @@ def get_client(root):
                 pass
             del _clients[root]
             client = None
+
         if client is None:
             client = ClangdClient(root).start()
             client.prime_index()
             _clients[root] = client
         return client
 
-@server.list_tools()
-async def list_tools():
-    return [
-        types.Tool(
-            name="get_function_info",
-            description=(
-                "Get definition location, declaration location, references "
-                "and callers of a C++ function. "
-                "Accepts plain function name e.g. 'PrepareErrMsg' "
-                "or qualified name e.g. 'Parser::PrepareErrMsg'."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Function name or ClassName::methodName"
-                    },
-                    "root": {
-                        "type": "string",
-                        "description": "Repo root path"
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["refs", "callers", "all"],
-                        "default": "all"
-                    }
-                },
-                "required": ["name", "root"]
-            }
-        ),
-        types.Tool(
-            name="get_class_info",
-            description=(
-                "Get declaration location and all methods of a C++ class. "
-                "For each method returns definition, declaration, "
-                "references and callers. "
-                "Use when asked about a class structure or workflow."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Class name e.g. Parser"
-                    },
-                    "root": {
-                        "type": "string",
-                        "description": "Repo root path"
-                    }
-                },
-                "required": ["name", "root"]
-            }
-        ),
-        types.Tool(
-            name="get_macro_info",
-            description=(
-                "Get declaration location and all usages/references of a C/C++ macro. "
-                "Returns the macro definition location (where it's #defined) "
-                "and all files/locations where the macro is used/expansion."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Macro name e.g. LOG_DEBUG"
-                    },
-                    "root": {
-                        "type": "string",
-                        "description": "Repo root path"
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["refs", "callers", "all"],
-                        "default": "all"
-                    }
-                },
-                "required": ["name", "root"]
-            }
-        ),
-        types.Tool(
-            name="get_struct_info",
-            description=(
-                "Get declaration location and all usages/references of a C/C++ struct. "
-                "Returns the struct definition location (where it's defined) "
-                "and all files/locations where the struct type is used."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Struct name e.g. nvme_ctrl_info"
-                    },
-                    "root": {
-                        "type": "string",
-                        "description": "Repo root path"
-                    },
-                    "include_decl": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Include the struct definition in the references list"
-                    }
-                },
-                "required": ["name", "root"]
-            }
-        ),
-        types.Tool(
-            name="get_hover_info",
-            description=(
-                "Get hover information (type, signature, documentation) for a symbol "
-                "at a specific position in a file. Returns the same info you'd see "
-                "when hovering over a symbol in VS Code."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path relative to repo root e.g. src/handler.cpp"
-                    },
-                    "line": {
-                        "type": "integer",
-                        "description": "Line number (0-based) e.g. 42 for line 43"
-                    },
-                    "col": {
-                        "type": "integer",
-                        "description": "Column number (0-based) e.g. 10"
-                    },
-                    "root": {
-                        "type": "string",
-                        "description": "Repo root path"
-                    }
-                },
-                "required": ["path", "line", "col", "root"]
-            }
-        ),
-        types.Tool(
-            name="get_incoming_calls",
-            description=(
-                "Get incoming call hierarchy (callers) for a C++ function. "
-                "Returns all functions/methods that call the specified function. "
-                "Use to understand who calls this function."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Function name or ClassName::methodName e.g. Parser::parse"
-                    },
-                    "root": {
-                        "type": "string",
-                        "description": "Repo root path"
-                    }
-                },
-                "required": ["name", "root"]
-            }
-        ),
-    ]
 
-def _run_tool(name: str, arguments: dict):
-    """The actual (blocking) query work. Runs in a worker thread via
-    asyncio.to_thread (see call_tool below) so the event loop stays free to
-    accept and dispatch other concurrent tool calls instead of blocking on
-    this one's clangd round-trips -- ClangdClient's request dispatch is
-    already thread-safe (that's what the pipelined class-query relies on),
-    so multiple tool calls can share the same warm daemon concurrently."""
-    root = arguments.get("root")
-    if not root:
-        return "Error: root path is required"
+def shutdown_all_clients():
+    """Stop every warm clangd (server exit, and the tests)."""
+    with _clients_lock:
+        clients = list(_clients.values())
+        _clients.clear()
+    for client in clients:
+        try:
+            client.shutdown()
+        except Exception:
+            pass
+
+
+# ============================= parameters =============================
+# A Param carries its own schema and its own validator, so the advertised
+# contract and the enforced one are one declaration. Validators return an
+# error string, or None if the value is fine.
+_MISSING = object()
+
+
+def _type_name(value):
+    """JSON type name -- the caller speaks JSON, not Python."""
+    return "null" if value is None else type(value).__name__
+
+
+class Param:
+    def __init__(self, name, schema, required=True, default=None,
+                 validate=None, hint=""):
+        self.name = name
+        self.schema = schema
+        self.required = required
+        self.default = default
+        self.hint = hint
+        self._validate = validate
+
+    def missing_error(self):
+        return "Error: %s is required%s" % (
+            self.name, " (%s)" % self.hint if self.hint else "")
+
+    def resolve(self, arguments):
+        """Return (error, value) for this parameter.
+
+        Blank counts as missing only when required ("root is required" beats
+        a type complaint). For an optional param a blank is a caller mistake,
+        not an omission, so it must not silently become the default.
+        """
+        raw = arguments.get(self.name, _MISSING)
+        supplied = raw is not _MISSING and raw is not None
+        if supplied and self.required and isinstance(raw, str) and not raw.strip():
+            supplied = False
+
+        if not supplied:
+            return (self.missing_error(), None) if self.required else (None, self.default)
+
+        error = self._validate(self.name, raw) if self._validate else None
+        return error, (None if error else raw)
+
+
+def _validate_repo_root(label, value):
+    """Reported paths are relativised against the root, so a file or a
+    missing directory yields nonsense like '(def .:171-171)'."""
+    if not isinstance(value, str):
+        return "Error: %s must be a string, got %s (%r)" % (
+            label, _type_name(value), value)
+    if not os.path.exists(value):
+        return "Error: %s path does not exist: %r" % (label, value)
+    if not os.path.isdir(value):
+        return "Error: %s path is not a directory: %r" % (label, value)
+    return None
+
+
+def _validate_symbol_name(label, value):
+    """Checked before clangd sees it: a non-string comes back as a bare
+    JSON-RPC -32602, naming neither the argument nor the problem."""
+    if not isinstance(value, str):
+        return "Error: %s must be a string, got %s (%r)" % (
+            label, _type_name(value), value)
+    return None
+
+
+def _validate_mode(label, value):
+    """An unknown mode matches no output section, so the caller would get a
+    definition line and silently none of the refs/callers they asked for."""
+    if not isinstance(value, str) or value not in VALID_MODES:
+        return "Error: %s must be one of %s, got %r" % (
+            label, ", ".join(VALID_MODES), value)
+    return None
+
+
+def _validate_file_path(label, value):
+    if not isinstance(value, str):
+        return "Error: %s must be a string, got %s (%r)" % (
+            label, _type_name(value), value)
+    return None
+
+
+def _validate_position(label, value):
+    """bool subclasses int, so `true` would otherwise pass as line 1."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "Error: %s must be an integer, got %s (%r)" % (
+            label, _type_name(value), value)
+    if value < 0:
+        return "Error: %s must not be negative, got %d" % (label, value)
+    return None
+
+
+def _validate_flag(label, value):
+    if not isinstance(value, bool):
+        return "Error: %s must be true or false, got %s (%r)" % (
+            label, _type_name(value), value)
+    return None
+
+
+ROOT = Param(
+    "root",
+    {"type": "string", "description": "Repo root path"},
+    validate=_validate_repo_root, hint="the repo root path",
+)
+SYMBOL = Param(
+    "name",
+    {"type": "string", "description": "Symbol name, plain or qualified"},
+    validate=_validate_symbol_name, hint="a non-empty symbol name",
+)
+MODE = Param(
+    "mode",
+    {"type": "string", "enum": list(VALID_MODES), "default": "all",
+     "description": "Which sections to return"},
+    required=False, default="all", validate=_validate_mode,
+)
+PATH = Param(
+    "path",
+    {"type": "string", "description": "File path e.g. src/handler.cpp"},
+    validate=_validate_file_path, hint="a file path",
+)
+LINE = Param(
+    "line",
+    {"type": "integer", "description": "Line number, 0-based"},
+    validate=_validate_position, hint="a 0-based integer line number",
+)
+COL = Param(
+    "col",
+    {"type": "integer", "description": "Column number, 0-based"},
+    validate=_validate_position, hint="a 0-based integer column number",
+)
+INCLUDE_DECL = Param(
+    "include_decl",
+    {"type": "boolean", "default": False,
+     "description": "Include the declaration in the references list"},
+    required=False, default=False, validate=_validate_flag,
+)
+
+
+# ============================== the tools ==============================
+class ToolSpec:
+    def __init__(self, name, description, params, handler):
+        self.name = name
+        self.description = description
+        self.params = params
+        self.handler = handler
+
+    def as_mcp_tool(self):
+        return types.Tool(
+            name=self.name,
+            description=self.description,
+            inputSchema={
+                "type": "object",
+                "properties": {p.name: p.schema for p in self.params},
+                "required": [p.name for p in self.params if p.required],
+            },
+        )
+
+    def resolve_arguments(self, arguments):
+        """Validate every declared param. Returns (error, values)."""
+        values = {}
+        for param in self.params:
+            error, value = param.resolve(arguments)
+            if error:
+                return error, None
+            values[param.name] = value
+        return None, values
+
+
+TOOLS = {}
+
+
+def _tool(name, description, params):
+    """Register a tool. The decorated function is its handler, called with
+    (client, args) already validated and defaulted."""
+    def register(handler):
+        TOOLS[name] = ToolSpec(name, description, params, handler)
+        return handler
+    return register
+
+
+@_tool(
+    "get_function_info",
+    "Get definition location, declaration location, references and callers "
+    "of a C++ function. Accepts a plain function name e.g. 'PrepareErrMsg' "
+    "or a qualified name e.g. 'Parser::PrepareErrMsg'.",
+    [ROOT, SYMBOL, MODE],
+)
+def _get_function_info(client, args):
+    return run_query_as_string(client, args["mode"], args["name"], QUERY_WAIT_S)
+
+
+@_tool(
+    "get_class_info",
+    "Get declaration location and all methods of a C++ class. For each method "
+    "returns definition, declaration, references and callers. Use when asked "
+    "about a class structure or workflow.",
+    [ROOT, SYMBOL, MODE],
+)
+def _get_class_info(client, args):
+    return run_class_query_as_string(client, args["mode"], args["name"], QUERY_WAIT_S)
+
+
+@_tool(
+    "get_macro_info",
+    "Get the declaration location of a C/C++ macro (where it is #defined). "
+    "Note clangd does not index macro expansion sites, so usage lists are "
+    "incomplete; the answer says so explicitly.",
+    [ROOT, SYMBOL, MODE],
+)
+def _get_macro_info(client, args):
+    return run_macro_query_as_string(client, args["mode"], args["name"], QUERY_WAIT_S)
+
+
+@_tool(
+    "get_struct_info",
+    "Get the declaration location of a C/C++ struct, including a typedef "
+    "struct.",
+    [ROOT, SYMBOL, INCLUDE_DECL],
+)
+def _get_struct_info(client, args):
+    return run_struct_query_as_string(
+        client, args["name"], QUERY_WAIT_S, include_decl=args["include_decl"])
+
+
+@_tool(
+    "get_hover_info",
+    "Get hover information (type, signature, documentation) for the symbol at "
+    "a specific position in a file -- the same info an IDE shows on hover.",
+    [ROOT, PATH, LINE, COL],
+)
+def _get_hover_info(client, args):
+    return run_hover_query_as_string(
+        client, args["path"], args["line"], args["col"], wait=HOVER_WAIT_S)
+
+
+@_tool(
+    "get_incoming_calls",
+    "Get the incoming call hierarchy (callers) for a C++ function: every "
+    "function or method that calls it.",
+    [ROOT, SYMBOL],
+)
+def _get_incoming_calls(client, args):
+    return run_incoming_calls_query_as_string(client, args["name"], QUERY_WAIT_S)
+
+
+# ============================== dispatch ==============================
+_NO_INDEX_WARNING = (
+    "# Warning: no compile_commands.json found under %r (checked that path "
+    "and its build/ subdir) -- clangd has no index, so results below are "
+    "likely empty regardless of the query.\n\n"
+)
+
+
+def _run_tool(name, arguments):
+    """Validate a tool call, run it, return its text.
+
+    Every failure returns a string rather than raising: an exception here
+    escapes through asyncio.to_thread and can kill the session, which a
+    malformed request must not be able to do. All validation happens up
+    front, so handlers see present, typed, defaulted arguments.
+    """
+    spec = TOOLS.get(name)
+    if spec is None:
+        return "Unknown tool: %s (known tools: %s)" % (
+            name, ", ".join(sorted(TOOLS)))
+
+    # A hand-rolled client can send anything; `.get` on a non-dict raises
+    # AttributeError straight out of the worker thread.
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return "Error: arguments must be an object, got %s (%r)" % (
+            _type_name(arguments), arguments)
+
+    error, args = spec.resolve_arguments(arguments)
+    if error:
+        return error
 
     try:
-        client = get_client(root)
+        client = get_client(args["root"])
     except Exception as e:
         return "Error starting clangd: %s" % e
 
-    # A missing compile_commands.json isn't an exception -- clangd starts
-    # fine, it just has nothing to index, so every query below will quietly
-    # come back empty forever. Callers have no other way to tell "no
-    # matches" apart from "no index", so say so up front.
-    warning = ""
-    if not client._db_found:
-        warning = (
-            "# Warning: no compile_commands.json found under %r (checked "
-            "that path and its build/ subdir) -- clangd has no index, so "
-            "results below are likely empty regardless of the query.\n\n"
-            % root
-        )
+    # clangd starts fine without a compile DB, it just indexes nothing --
+    # and the caller can't tell "no matches" from "no index".
+    warning = "" if client._db_found else _NO_INDEX_WARNING % args["root"]
 
     try:
-        if name in ("get_function_info", "get_class_info", "get_macro_info", "get_incoming_calls"):
-            sym_name = arguments.get("name")
-            if not sym_name:
-                return warning + "Error: name is required"
-
-            if name == "get_function_info":
-                result = run_query_as_string(client, arguments.get("mode", "all"), sym_name, 120)
-            elif name == "get_class_info":
-                result = run_class_query_as_string(client, arguments.get("mode", "all"), sym_name, 120)
-            elif name == "get_macro_info":
-                result = run_macro_query_as_string(client, arguments.get("mode", "all"), sym_name, 120)
-            else:  # get_incoming_calls
-                result = run_incoming_calls_query_as_string(client, sym_name, 120)
-
-        elif name == "get_struct_info":
-            sym_name = arguments.get("name")
-            if not sym_name:
-                return warning + "Error: name is required"
-            result = run_struct_query_as_string(
-                client, sym_name, 120, include_decl=arguments.get("include_decl", False)
-            )
-
-        elif name == "get_hover_info":
-            path = arguments.get("path")
-            line = arguments.get("line")
-            col = arguments.get("col")
-            if not path:
-                return warning + "Error: path is required"
-            if not isinstance(line, int) or not isinstance(col, int):
-                return warning + "Error: line and col must be integers (got line=%r, col=%r)" % (line, col)
-            result = run_hover_query_as_string(client, path, line, col, wait=10)
-
-        else:
-            return warning + "Unknown tool: %s" % name
-
-        return warning + result
-
+        return warning + spec.handler(client, args)
     except Exception as e:
         return warning + "Error running query: %s" % e
 
+
+# ============================ server plumbing ============================
+@server.list_tools()
+async def list_tools():
+    return [spec.as_mcp_tool() for spec in TOOLS.values()]
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    # Off the event loop, so other calls dispatch while this waits on clangd.
     result = await asyncio.to_thread(_run_tool, name, arguments)
     return [types.TextContent(type="text", text=result)]
 
@@ -294,9 +404,14 @@ async def main():
             await server.run(read, write, server.create_initialization_options())
     except Exception as e:
         print("clangq_mcp main() crashed: %s" % e, file=sys.stderr)
+    except BaseException as e:
+        print("clangq_mcp main() crashed: %s" % e, file=sys.stderr)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        print("clangq_mcp interrupted", file=sys.stderr)
     except Exception as e:
         print("clangq_mcp asyncio.run() crashed: %s" % e, file=sys.stderr)
+        sys.exit(1)

@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# test corpus compilation database / clangd index
+tests/fixtures/corpus/build/
+tests/fixtures/corpus/.cache/
