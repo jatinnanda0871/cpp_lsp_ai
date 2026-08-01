@@ -624,6 +624,193 @@ def run_struct_query(client, name, wait, include_decl=False, verbose=False, out=
         print("", file=out)
 
 
+# ========================= symbol search =========================
+# Kind numbers as clangd actually reports them, checked against the fixture
+# corpus rather than read off the LSP spec: a C++ struct (plain or typedef)
+# comes back as Class, and a #define as String -- LSP has no Macro kind, so
+# clangd reuses String. The rest follow the spec. An unrecognised number is
+# rendered as-is, so a future clangd that adds kinds degrades to a readable
+# label instead of mislabelling the symbol.
+SYMBOL_KIND_NAMES = {
+    3: "namespace", 5: "class", 6: "method", 8: "field",
+    9: "constructor", 10: "enum", 11: "interface", 12: "function",
+    13: "variable", 14: "constant", 15: "macro", 22: "enum-member",
+    23: "struct", 25: "operator", 26: "type-param",
+}
+
+# What a caller may pass as `kind`. The sets are deliberately generous: a
+# filter that silently matches nothing reads as "no such symbol exists",
+# which is the worst answer a discovery tool can give. 'struct' therefore
+# includes Class, because that is where clangd files structs.
+SEARCH_KIND_FILTERS = {
+    "function":  (12, 6, 9, 25),
+    "method":    (6, 9),
+    "class":     (5, 23, 11),
+    "struct":    (5, 23, 11),
+    "enum":      (10, 22),
+    "variable":  (13, 14, 8),
+    "field":     (8,),
+    "namespace": (3,),
+    "macro":     (15,),
+    "type":      (5, 23, 11, 10, 26),
+}
+
+# Enough rows to survey a name across a large repo, few enough not to bury
+# the caller. Raise per call with `limit`.
+DEFAULT_SEARCH_LIMIT = 30
+MAX_SEARCH_LIMIT = 200
+
+# clangd's own --limit-results default. Hitting it exactly almost always
+# means the list was cut server-side, and a caller reading a truncated list
+# as complete is how "that symbol doesn't exist" gets said with confidence.
+CLANGD_RESULT_CAP = 100
+
+
+def kind_label(kind):
+    return SYMBOL_KIND_NAMES.get(kind, "kind%s" % (kind,))
+
+
+def qualified_name(sym):
+    """'Backend::process' from clangd's split name/containerName.
+
+    Search exists to hand names to the other queries, and those resolve
+    'Class::method' (see exact_matches) but not a bare 'process', which would
+    land on whichever overload in whichever class clangd ranked first.
+    """
+    name = sym.get("name") or "?"
+    container = (sym.get("containerName") or "").strip()
+    if not container or name.startswith(container + "::"):
+        return name
+    return "%s::%s" % (container, name)
+
+
+def _search_row(sym, base):
+    return "  %-11s %-38s %s" % (
+        kind_label(sym.get("kind")), qualified_name(sym),
+        loc_str(sym.get("location") or {}, base))
+
+
+def _search_macro_fallback(client, query, wait):
+    """Macros that workspace/symbol cannot see, found the way resolve_macro
+    finds them.
+
+    clangd only reports a #define once its defining file is open, so a plain
+    index lookup misses every macro in the repo and search would blame the
+    caller's spelling for it. resolve_macro locates the #define, opens that
+    file and re-asks; it returns [] cheaply when nothing defines the name, so
+    this is affordable on the miss path only.
+
+    Exact names only -- the locator greps for '#define <name>' -- which is
+    the case that matters: a caller who read the macro in some source file
+    and wants to know where it lives.
+    """
+    resolve = getattr(client, "resolve_macro", None)
+    if resolve is None:
+        return []
+    try:
+        return resolve(query, deadline_s=wait) or []
+    except Exception:
+        # A best-effort fallback must not turn a clean "not found" into an
+        # error; the caller still gets the no-match message below.
+        return []
+
+
+def run_search_query(client, query, kind=None, limit=DEFAULT_SEARCH_LIMIT,
+                     wait=10, verbose=False, out=None):
+    """Fuzzy symbol search: the entry point for a caller who does not yet know
+    an exact name.
+
+    Inverts this module's usual stance on inexact hits. Everywhere else a
+    fuzzy match is a warning sign and gets flagged as one (see
+    inexact_match_note); here it is the entire point, so fuzzy results are
+    sectioned and labelled instead. The caller picks a qualified name off the
+    list and feeds it to run_query / run_class_query.
+    """
+    base = client_root(client)
+    out = out or sys.stdout
+
+    if not isinstance(query, str) or not query.strip():
+        print("# search: a non-empty query string is required", file=out)
+        return
+
+    kinds = None
+    if kind is not None:
+        kinds = SEARCH_KIND_FILTERS.get(kind)
+        if kinds is None:
+            print("# search: unknown kind %r (valid: %s)"
+                  % (kind, ", ".join(sorted(SEARCH_KIND_FILTERS))), file=out)
+            return
+
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = DEFAULT_SEARCH_LIMIT
+    limit = max(1, min(limit, MAX_SEARCH_LIMIT))
+
+    symbols = client.resolve_symbol(query, deadline_s=wait) or []
+    if not symbols:
+        symbols = _search_macro_fallback(client, query, wait)
+    if not symbols:
+        print("# no symbols matching %r (clangd's index has nothing close to "
+              "that name -- check the spelling or the --root)" % query, file=out)
+        return
+
+    matched = symbols
+    if kinds is not None:
+        matched = [s for s in symbols if s.get("kind") in kinds]
+        if not matched and kind == "macro":
+            # Asked for macros and found none, but a plain workspace/symbol
+            # never sees a macro anyway -- look properly before answering.
+            matched = _search_macro_fallback(client, query, wait)
+        if not matched:
+            # Distinct from "nothing matches": the name exists, the filter is
+            # what excluded it. Naming the kinds actually found lets the
+            # caller correct the filter instead of concluding it is absent.
+            found = ", ".join(sorted({kind_label(s.get("kind")) for s in symbols}))
+            print("# %d symbol%s match %r, but none of kind %r (found: %s)"
+                  % (len(symbols), "" if len(symbols) == 1 else "s",
+                     query, kind, found), file=out)
+            return
+
+    exact = exact_matches(matched, query)
+    exact_ids = {id(s) for s in exact}
+    fuzzy = [s for s in matched if id(s) not in exact_ids]
+    exact.sort(key=qualified_name)
+    fuzzy.sort(key=qualified_name)
+
+    # Exact hits spend the budget first -- a truncated list that dropped the
+    # one symbol the caller literally named would be actively misleading.
+    shown_exact = exact[:limit]
+    shown_fuzzy = fuzzy[:max(0, limit - len(shown_exact))]
+    total = len(matched)
+    shown = len(shown_exact) + len(shown_fuzzy)
+
+    print("# %d symbol%s matching %r (%s), showing %d"
+          % (total, "" if total == 1 else "s", query,
+             "kind=%s" % kind if kind else "any kind", shown),
+          file=out)
+
+    if shown_exact:
+        print("# exact (%d):" % len(exact), file=out)
+        for sym in shown_exact:
+            print(_search_row(sym, base), file=out)
+
+    if shown_fuzzy:
+        print("# fuzzy -- %s named %r exactly (%d):"
+              % ("nothing else is" if shown_exact else "nothing is",
+                 query, len(fuzzy)), file=out)
+        for sym in shown_fuzzy:
+            print(_search_row(sym, base), file=out)
+
+    if shown < total:
+        print("# %d more not shown (limit=%d) -- narrow the query or raise limit"
+              % (total - shown, limit), file=out)
+
+    if len(symbols) >= CLANGD_RESULT_CAP:
+        print("# note: clangd returned its maximum of %d results, so this list "
+              "is not exhaustive" % len(symbols), file=out)
+
+
 # ========================= hover queries =========================
 def _hover_text(contents):
     """Flatten hover's payload -- MarkupContent, a MarkedString, or an
@@ -722,6 +909,12 @@ def run_hover_query_as_string(client, path, line, col, wait=10, verbose=False):
 
 def run_incoming_calls_query_as_string(client, name, wait=120, verbose=False):
     return _as_string(run_incoming_calls_query, client, name, wait, verbose)
+
+
+def run_search_query_as_string(client, query, kind=None,
+                               limit=DEFAULT_SEARCH_LIMIT, wait=10,
+                               verbose=False):
+    return _as_string(run_search_query, client, query, kind, limit, wait, verbose)
 
 # ===================== daemon transport =====================
 def _user():

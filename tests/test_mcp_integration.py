@@ -10,10 +10,15 @@ Skipped when clangd or the `mcp` package is missing.
     python3 -m unittest tests.test_mcp_integration -v
 """
 import os
+import sys
 import threading
 import unittest
 
-import support
+# So `python3 -m unittest tests.test_mcp_integration` works from the repo root,
+# where tests/ is not on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import support  # noqa: E402  (needs the path set up first)
 
 try:
     import clangq_mcp
