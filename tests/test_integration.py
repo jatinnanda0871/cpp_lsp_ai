@@ -30,6 +30,8 @@ from clangd_query_engine import (
     run_hover_query_as_string,
     run_incoming_calls_query_as_string,
     run_search_query_as_string,
+    run_outline_query_as_string,
+    run_diagnostics_query_as_string,
 )
 
 CLANGD = support.find_clangd()
@@ -167,6 +169,107 @@ class TestSymbolSearch(IntegrationBase):
         self.assertNoError(out, "search miss")
         self.assertTrue(out.strip(), "a miss returned an empty string")
         self.assertIn("no symbols matching", out)
+
+
+class TestFileOutline(IntegrationBase):
+    def test_header_lists_its_classes_and_methods(self):
+        out = run_outline_query_as_string(self.client, "include/chains.h", wait=WAIT)
+        self.assertNoError(out, "outline chains.h")
+        for expected in ("Backend", "Frontend", "process", "handleRequest"):
+            self.assertIn(expected, out, "%r missing from outline:\n%s"
+                          % (expected, out))
+
+    def test_methods_are_nested_under_their_class(self):
+        out = run_outline_query_as_string(self.client, "include/chains.h", wait=WAIT)
+        # keyed by kind AND name: 'Backend' is both the class and its
+        # constructor, and keying on the name alone lets one shadow the other
+        rows = {}
+        for line in out.splitlines():
+            if line.startswith("#") or not line.startswith("  "):
+                continue
+            parts = line.split()
+            if len(parts) > 2:
+                rows[(parts[0], parts[1])] = len(line) - len(line.lstrip())
+        self.assertIn(("class", "Backend"), rows, out)
+        self.assertIn(("method", "process"), rows, out)
+        self.assertGreater(rows[("method", "process")], rows[("class", "Backend")],
+                           "method not nested under its class:\n%s" % out)
+
+    def test_signatures_come_through_in_detail(self):
+        """clangd puts the signature in `detail`, which is what makes an
+        outline a substitute for reading the file rather than an index."""
+        out = run_outline_query_as_string(self.client, "include/chains.h", wait=WAIT)
+        self.assertIn("corpus::Str", out,
+                      "no parameter types in the outline:\n%s" % out)
+
+    def test_spans_match_the_real_file(self):
+        """A long method must report a span far from its start, or the ranges
+        are not safe to read against."""
+        out = run_outline_query_as_string(self.client, "src/big.cpp", wait=WAIT)
+        spans = [tuple(int(x) for x in m.group(1, 2))
+                 for m in re.finditer(r"\s(\d+)-(\d+)(?:\s|$)", out)]
+        self.assertTrue(any(end - start > 20 for start, end in spans),
+                        "no long span found in big.cpp:\n%s" % out)
+
+    def test_limit_bounds_the_output(self):
+        out = run_outline_query_as_string(
+            self.client, "src/util.cpp", limit=5, wait=WAIT)
+        rows = [l for l in out.splitlines() if not l.startswith("#")]
+        self.assertLessEqual(len(rows), 5)
+        self.assertIn("more not shown", out)
+
+    def test_missing_file_reports_clearly(self):
+        out = run_outline_query_as_string(self.client, "src/nope.cpp", wait=WAIT)
+        self.assertTrue(out.strip(), "a missing file returned an empty string")
+        self.assertIn("nope.cpp", out)
+
+
+class TestDiagnostics(IntegrationBase):
+    def test_clean_file_is_reported_as_clean(self):
+        out = run_diagnostics_query_as_string(
+            self.client, "src/chains.cpp", wait=WAIT)
+        self.assertNoError(out, "diagnostics chains.cpp")
+        self.assertIn("cleanly", out)
+
+    def test_an_edit_on_disk_is_seen(self):
+        """The whole point of the tool, and the reason did_open had to learn
+        about staleness: without it clangd keeps answering from the contents
+        at first open, so a freshly broken file still reports clean."""
+        path = "src/chains.cpp"
+        target = support.corpus_source(path)
+        with open(target, "r", encoding="utf-8") as f:
+            original = f.read()
+        try:
+            before = run_diagnostics_query_as_string(self.client, path, wait=WAIT)
+            self.assertIn("cleanly", before, "fixture did not start clean:\n%s" % before)
+
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(original + "\nint broken() { return no_such_identifier; }\n")
+
+            after = run_diagnostics_query_as_string(
+                self.client, path, severity="error", wait=WAIT)
+            self.assertNoError(after, "diagnostics after edit")
+            self.assertIn("no_such_identifier", after,
+                          "the edit was not seen -- stale document:\n%s" % after)
+            self.assertNotIn("cleanly", after)
+        finally:
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(original)
+
+        restored = run_diagnostics_query_as_string(self.client, path, wait=WAIT)
+        self.assertIn("cleanly", restored,
+                      "file did not go clean again after restore:\n%s" % restored)
+
+    def test_severity_filter_is_applied(self):
+        out = run_diagnostics_query_as_string(
+            self.client, "src/chains.cpp", severity="error", wait=WAIT)
+        self.assertNoError(out, "severity filter")
+        self.assertTrue(out.strip())
+
+    def test_missing_file_reports_clearly(self):
+        out = run_diagnostics_query_as_string(self.client, "src/nope.cpp", wait=WAIT)
+        self.assertTrue(out.strip(), "a missing file returned an empty string")
+        self.assertIn("nope.cpp", out)
 
 
 class TestFunctionQueries(IntegrationBase):

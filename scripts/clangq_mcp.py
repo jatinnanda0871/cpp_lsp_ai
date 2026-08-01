@@ -25,9 +25,15 @@ from clangd_query_engine import (
     run_hover_query_as_string,
     run_incoming_calls_query_as_string,
     run_search_query_as_string,
+    run_outline_query_as_string,
+    run_diagnostics_query_as_string,
     SEARCH_KIND_FILTERS,
     DEFAULT_SEARCH_LIMIT,
     MAX_SEARCH_LIMIT,
+    DEFAULT_OUTLINE_LIMIT,
+    MAX_OUTLINE_LIMIT,
+    SEVERITY_FILTERS,
+    DEFAULT_SEVERITY,
 )
 
 # ============================ tunables ============================
@@ -37,6 +43,11 @@ QUERY_WAIT_S = 120
 
 # Hover reads the open file's AST, no index needed.
 HOVER_WAIT_S = 10
+
+# Diagnostics arrive unprompted once clangd finishes parsing the TU, so this
+# budgets a full reparse of a heavy translation unit -- longer than hover,
+# which only queries an AST that already exists.
+DIAGNOSTICS_WAIT_S = 30
 
 VALID_MODES = ("refs", "callers", "all")
 
@@ -207,6 +218,25 @@ def _validate_kind(label, value):
     return None
 
 
+def _validate_severity(label, value):
+    if not isinstance(value, str) or value not in SEVERITY_FILTERS:
+        return "Error: %s must be one of %s, got %r" % (
+            label, ", ".join(sorted(SEVERITY_FILTERS)), value)
+    return None
+
+
+def _validate_outline_limit(label, value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "Error: %s must be an integer, got %s (%r)" % (
+            label, _type_name(value), value)
+    if value < 1:
+        return "Error: %s must be at least 1, got %d" % (label, value)
+    if value > MAX_OUTLINE_LIMIT:
+        return "Error: %s must not exceed %d, got %d" % (
+            label, MAX_OUTLINE_LIMIT, value)
+    return None
+
+
 def _validate_limit(label, value):
     """bool subclasses int here too, and a cap keeps one call from flooding
     the caller's context with a whole repo's symbol table."""
@@ -276,6 +306,22 @@ SEARCH_LIMIT = Param(
      "minimum": 1, "maximum": MAX_SEARCH_LIMIT,
      "description": "Maximum rows to return (default %d)" % DEFAULT_SEARCH_LIMIT},
     required=False, default=DEFAULT_SEARCH_LIMIT, validate=_validate_limit,
+)
+OUTLINE_LIMIT = Param(
+    "limit",
+    {"type": "integer", "default": DEFAULT_OUTLINE_LIMIT,
+     "minimum": 1, "maximum": MAX_OUTLINE_LIMIT,
+     "description": "Maximum rows to return (default %d)" % DEFAULT_OUTLINE_LIMIT},
+    required=False, default=DEFAULT_OUTLINE_LIMIT,
+    validate=_validate_outline_limit,
+)
+SEVERITY = Param(
+    "severity",
+    {"type": "string", "enum": sorted(SEVERITY_FILTERS),
+     "default": DEFAULT_SEVERITY,
+     "description": "Lowest severity to report: 'error', 'warning' "
+                    "(errors+warnings), or 'all'"},
+    required=False, default=DEFAULT_SEVERITY, validate=_validate_severity,
 )
 
 
@@ -382,6 +428,33 @@ def _get_macro_info(client, args):
 def _get_struct_info(client, args):
     return run_struct_query_as_string(
         client, args["name"], QUERY_WAIT_S, include_decl=args["include_decl"])
+
+
+@_tool(
+    "get_file_outline",
+    "List every symbol declared in one file -- classes, methods, functions, "
+    "fields -- nested, with line spans and signatures. Use it to orient in an "
+    "unfamiliar or large file for a fraction of the cost of reading it, then "
+    "read the exact line range you need.",
+    [ROOT, PATH, OUTLINE_LIMIT],
+)
+def _get_file_outline(client, args):
+    return run_outline_query_as_string(
+        client, args["path"], limit=args["limit"], wait=HOVER_WAIT_S)
+
+
+@_tool(
+    "get_diagnostics",
+    "Get clangd's compiler diagnostics (errors, warnings) for one file, "
+    "reflecting what is on disk right now. Use it after editing C/C++ to "
+    "check the file still parses without running the build. Note a file "
+    "outside compile_commands.json is parsed with guessed flags and can "
+    "report spurious errors.",
+    [ROOT, PATH, SEVERITY],
+)
+def _get_diagnostics(client, args):
+    return run_diagnostics_query_as_string(
+        client, args["path"], severity=args["severity"], wait=DIAGNOSTICS_WAIT_S)
 
 
 @_tool(

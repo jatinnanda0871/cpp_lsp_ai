@@ -44,7 +44,16 @@ class ClangdClient:
         self._id_lock = threading.Lock()
         self._pending = {}
         self._pending_lock = threading.Lock()
-        self._opened = set()
+        # uri -> (stat stamp, version). The stamp is what makes a re-query
+        # after an edit see the new contents; see did_open.
+        self._opened = {}
+        self._open_lock = threading.Lock()
+        # uri -> diagnostics, filled by the reader from clangd's unsolicited
+        # publishDiagnostics notifications. The Event per uri is what lets a
+        # caller tell "clean" from "not reported yet".
+        self._diagnostics = {}
+        self._diag_events = {}
+        self._diag_lock = threading.Lock()
         self._index_warm = False  # set once workspace/symbol returns anything
 
         args = [clangd, "--background-index" if background_index else "--background-index=0"]
@@ -185,7 +194,9 @@ class ClangdClient:
                     self._send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
                     continue
                 method = msg.get("method")               # notification
-                if method == "$/progress":
+                if method == "textDocument/publishDiagnostics":
+                    self._store_diagnostics(msg.get("params") or {})
+                elif method == "$/progress":
                     val = (msg.get("params") or {}).get("value") or {}
                     if self.log:
                         sys.stderr.write("[clangd] %s %s\n" % (val.get("kind"), val.get("title", "")))
@@ -219,6 +230,7 @@ class ClangdClient:
                     "references": {},
                     "callHierarchy": {"dynamicRegistration": False},
                     "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
+                    "publishDiagnostics": {"relatedInformation": False},
                 },
                 "window": {"workDoneProgress": True},
             },
@@ -234,24 +246,112 @@ class ClangdClient:
     def _uri(self, path):
         return pathlib.Path(path).resolve().as_uri()
 
+    # ---- diagnostics ----------------------------------------------------
+    def _store_diagnostics(self, params):
+        """Record one publishDiagnostics notification.
+
+        Unsolicited: clangd pushes these whenever it finishes parsing a TU,
+        with no request to correlate against, so they have to be caught as
+        they arrive rather than asked for.
+        """
+        uri = params.get("uri")
+        if not uri:
+            return
+        diags = params.get("diagnostics")
+        with self._diag_lock:
+            self._diagnostics[uri] = diags if isinstance(diags, list) else []
+            event = self._diag_events.get(uri)
+            if event is None:
+                event = self._diag_events[uri] = threading.Event()
+            event.set()
+
+    def _invalidate_diagnostics(self, uri):
+        """Drop what clangd said about the previous contents of `uri`.
+
+        Called BEFORE the didChange goes out, not after: clangd can publish
+        for the new version before this thread runs again, and clearing the
+        event after that lands would discard the fresh result and then block
+        until the timeout waiting for one that already arrived.
+        """
+        with self._diag_lock:
+            self._diagnostics.pop(uri, None)
+            event = self._diag_events.get(uri)
+            if event is not None:
+                event.clear()
+
+    def diagnostics(self, path, timeout=15):
+        """Diagnostics for `path`, as (list, received).
+
+        `received` separates a file clangd parsed cleanly (empty list, and it
+        said so) from one it has not reported on yet (empty list because
+        nothing arrived). Collapsing those two into "no problems" would hand
+        back a false all-clear on a file that may not even compile.
+        """
+        uri = self.did_open(path)
+        with self._diag_lock:
+            event = self._diag_events.get(uri)
+            if event is None:
+                event = self._diag_events[uri] = threading.Event()
+        if not event.wait(timeout):
+            return [], False
+        with self._diag_lock:
+            return list(self._diagnostics.get(uri) or []), True
+
+    # ---- documents ------------------------------------------------------
     def did_open(self, path):
+        """Open `path` with clangd, or push its new contents if it changed.
+
+        The staleness check is what makes this safe for a long-lived client.
+        clangd answers from the text it was last given, so without it a
+        caller that edits a file and re-queries keeps getting answers
+        computed from the contents at first open -- silently, and for the
+        life of the process, since nothing else ever re-reads the file.
+
+        Locked because tool calls run in worker threads: two of them racing
+        here would otherwise both see "not open yet" and send didOpen twice
+        for the same document.
+        """
         uri = self._uri(path)
-        if uri in self._opened:
+        with self._open_lock:
+            # Every query entry point funnels through here, so a bad path
+            # (typo, stale location from the index, a directory) would
+            # otherwise surface as a bare OSError with no indication of which
+            # file or which query caused it.
+            try:
+                info = os.stat(path)
+            except OSError as e:
+                raise RuntimeError("cannot open source file %r: %s" % (path, e))
+            stamp = (info.st_mtime_ns, info.st_size)
+
+            state = self._opened.get(uri)
+            if state is not None and state[0] == stamp:
+                return uri     # unchanged since we last sent it; stat only
+
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                raise RuntimeError("cannot open source file %r: %s" % (path, e))
+
+            if state is None:
+                version = 1
+                self._invalidate_diagnostics(uri)
+                self._notify("textDocument/didOpen", {
+                    "textDocument": {"uri": uri, "languageId": "cpp",
+                                     "version": version, "text": text},
+                })
+            else:
+                # Full-document replacement. Valid whichever sync mode the
+                # server negotiated, and the client has no edit deltas to
+                # send -- it is reading files off disk, not tracking typing.
+                version = state[1] + 1
+                self._invalidate_diagnostics(uri)
+                self._notify("textDocument/didChange", {
+                    "textDocument": {"uri": uri, "version": version},
+                    "contentChanges": [{"text": text}],
+                })
+            self._opened[uri] = (stamp, version)
             return uri
-        # Every query entry point funnels through here, so a bad path
-        # (typo, stale location from the index, a directory) would
-        # otherwise surface as a bare OSError with no indication of which
-        # file or which query caused it.
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
-        except OSError as e:
-            raise RuntimeError("cannot open source file %r: %s" % (path, e))
-        self._notify("textDocument/didOpen", {
-            "textDocument": {"uri": uri, "languageId": "cpp", "version": 1, "text": text},
-        })
-        self._opened.add(uri)
-        return uri
 
     def prime_index(self):
         """Open one source file from the compile DB.

@@ -36,7 +36,11 @@ def blank_client():
     c._id_lock = threading.Lock()
     c._pending = {}
     c._pending_lock = threading.Lock()
-    c._opened = set()
+    c._opened = {}
+    c._open_lock = threading.Lock()
+    c._diagnostics = {}
+    c._diag_events = {}
+    c._diag_lock = threading.Lock()
     c._index_warm = False
     c.root = os.getcwd()
     c.proc = None
@@ -786,3 +790,310 @@ class TestSymbolSearch(unittest.TestCase):
         a clean miss rather than an AttributeError."""
         text = self.search([], "SOME_MACRO")
         self.assertIn("no symbols matching", text)
+
+
+class FakeOutlineClient:
+    """A client that answers documentSymbol and nothing else."""
+    def __init__(self, symbols=None, root="/repo", error=None):
+        self._symbols = symbols
+        self._error = error
+        self.root = root
+
+    def document_symbol(self, path):
+        if self._error:
+            raise RuntimeError(self._error)
+        return self._symbols
+
+
+class TestFileOutline(unittest.TestCase):
+    def node(self, name, kind=6, start=0, end=0, detail="", children=None):
+        node = {"name": name, "kind": kind, "detail": detail,
+                "range": {"start": {"line": start}, "end": {"line": end}}}
+        if children is not None:
+            node["children"] = children
+        return node
+
+    def outline(self, symbols, **kwargs):
+        client = FakeOutlineClient(symbols=symbols)
+        out = io.StringIO()
+        qe.run_outline_query(client, "a.cpp", out=out, **kwargs)
+        return out.getvalue()
+
+    def test_nested_symbols_are_indented(self):
+        tree = [self.node("Cls", 5, 0, 9, children=[self.node("m", 6, 2, 4)])]
+        lines = self.outline(tree).splitlines()
+        parent = [l for l in lines if "Cls" in l][0]
+        child = [l for l in lines if " m " in l][0]
+        self.assertLess(len(parent) - len(parent.lstrip()),
+                        len(child) - len(child.lstrip()),
+                        "child not indented deeper:\n%s" % "\n".join(lines))
+
+    def test_spans_are_one_based(self):
+        """Reported line numbers must match what an editor shows, since the
+        caller's next move is to read that range."""
+        text = self.outline([self.node("f", 12, 9, 19)])
+        self.assertIn("10-20", text)
+
+    def test_signature_detail_is_carried(self):
+        """The point of using detail: types without a second query."""
+        text = self.outline([self.node("f", 12, 0, 0, detail="int (const Str &)")])
+        self.assertIn("int (const Str &)", text)
+
+    def test_detail_that_merely_repeats_the_kind_is_dropped(self):
+        text = self.outline([self.node("Cls", 5, 0, 9, detail="class")])
+        self.assertEqual(text.count("class"), 1, text)
+
+    def test_flat_symbolinformation_shape_is_handled(self):
+        """The reply shape is negotiated; a server that declines the
+        hierarchical capability sends ranges nested under location."""
+        flat = [{"name": "f", "kind": 12,
+                 "location": {"uri": "file:///repo/a.cpp",
+                              "range": {"start": {"line": 4}, "end": {"line": 6}}}}]
+        self.assertIn("5-7", self.outline(flat))
+
+    def test_empty_outline_is_explained_not_blank(self):
+        text = self.outline([])
+        self.assertIn("no symbols", text)
+        self.assertIn("compile_commands.json", text)
+
+    def test_limit_truncates_and_reports_the_remainder(self):
+        text = self.outline([self.node("f%d" % i) for i in range(10)], limit=4)
+        self.assertIn("6 more not shown", text)
+
+    def test_malformed_nodes_do_not_crash(self):
+        tree = [self.node("ok"), "junk", None,
+                {"name": None, "kind": 6, "range": None}]
+        text = self.outline(tree)
+        self.assertIn("ok", text)
+        self.assertIn("(unnamed)", text)
+
+    def test_failure_is_reported_not_raised(self):
+        client = FakeOutlineClient(error="clangd exited")
+        out = io.StringIO()
+        qe.run_outline_query(client, "a.cpp", out=out)
+        self.assertIn("failed", out.getvalue())
+
+
+class FakeDiagClient:
+    """A client that answers the diagnostics() contract: (list, received)."""
+    def __init__(self, diags=None, received=True, root="/repo", error=None):
+        self._diags = diags or []
+        self._received = received
+        self._error = error
+        self.root = root
+
+    def diagnostics(self, path, timeout=15):
+        if self._error:
+            raise RuntimeError(self._error)
+        return self._diags, self._received
+
+
+class TestDiagnostics(unittest.TestCase):
+    def diag(self, message="boom", severity=1, line=0, col=0,
+             source="clang", code=None):
+        return {"message": message, "severity": severity, "source": source,
+                "code": code,
+                "range": {"start": {"line": line, "character": col}}}
+
+    def report(self, diags, received=True, **kwargs):
+        client = FakeDiagClient(diags=diags, received=received)
+        out = io.StringIO()
+        qe.run_diagnostics_query(client, "a.cpp", out=out, **kwargs)
+        return out.getvalue()
+
+    def test_unreported_is_never_called_clean(self):
+        """The failure this branch exists to prevent: clangd never answered,
+        and the caller acts on a false all-clear."""
+        text = self.report([], received=False)
+        self.assertIn("NOT a clean bill of health", text)
+        self.assertNotIn("parsed it cleanly", text)
+
+    def test_clean_file_says_so_positively(self):
+        text = self.report([], received=True)
+        self.assertIn("parsed it cleanly", text)
+
+    def test_counts_are_summarised(self):
+        text = self.report([self.diag(severity=1), self.diag(severity=1),
+                            self.diag(severity=2)])
+        self.assertIn("2 errors, 1 warning", text)
+
+    def test_severity_filter_keeps_errors_only(self):
+        text = self.report([self.diag("bad", 1), self.diag("meh", 2)],
+                           severity="error")
+        self.assertIn("bad", text)
+        self.assertNotIn("meh", text)
+
+    def test_warning_filter_includes_errors(self):
+        """'warning' means 'at least warning' -- dropping errors from a
+        warning-level report would hide the more serious problem."""
+        text = self.report([self.diag("bad", 1), self.diag("meh", 2)],
+                           severity="warning")
+        self.assertIn("bad", text)
+        self.assertIn("meh", text)
+
+    def test_filtered_to_nothing_still_reports_what_exists(self):
+        """Must not read as 'file is clean' when it has warnings."""
+        text = self.report([self.diag("meh", 2)], severity="error")
+        self.assertIn("no diagnostics at severity", text)
+        self.assertIn("1 warning", text)
+
+    def test_unknown_severity_is_rejected(self):
+        text = self.report([self.diag()], severity="critical")
+        self.assertIn("unknown severity", text)
+
+    def test_rows_are_one_based_and_ordered_by_line(self):
+        text = self.report([self.diag("second", 1, line=9),
+                            self.diag("first", 1, line=2)])
+        rows = [l for l in text.splitlines() if not l.startswith("#")]
+        self.assertIn("first", rows[0])
+        self.assertIn(":3:1", rows[0])
+        self.assertIn("second", rows[1])
+
+    def test_source_and_code_are_tagged(self):
+        text = self.report([self.diag(source="clang", code="undeclared_var_use")])
+        self.assertIn("[clang:undeclared_var_use]", text)
+
+    def test_missing_source_and_code_leave_no_empty_brackets(self):
+        text = self.report([self.diag(source=None, code=None)])
+        self.assertNotIn("[]", text)
+
+    def test_multiline_message_is_flattened(self):
+        """A raw newline would break the one-row-per-diagnostic format."""
+        text = self.report([self.diag("line one\nline two")])
+        self.assertIn("line one line two", text)
+
+    def test_malformed_diagnostics_do_not_crash(self):
+        text = self.report(["junk", None, {"message": "ok", "severity": 1}])
+        self.assertIn("ok", text)
+
+    def test_failure_is_reported_not_raised(self):
+        client = FakeDiagClient(error="clangd exited")
+        out = io.StringIO()
+        qe.run_diagnostics_query(client, "a.cpp", out=out)
+        self.assertIn("failed", out.getvalue())
+
+
+class TestDocumentStaleness(unittest.TestCase):
+    """A long-lived client outlives the files it reads. Without a staleness
+    check every answer after an edit is computed from the contents at first
+    open -- silently, and for the life of the process."""
+
+    def client_recording_notifies(self):
+        c = blank_client()
+        sent = []
+        c._notify = lambda method, params: sent.append((method, params))
+        return c, sent
+
+    def test_first_open_sends_did_open(self):
+        c, sent = self.client_recording_notifies()
+        with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:
+            f.write("int a;\n")
+            path = f.name
+        try:
+            c.did_open(path)
+            self.assertEqual([m for m, _ in sent], ["textDocument/didOpen"])
+        finally:
+            os.unlink(path)
+
+    def test_unchanged_file_is_not_resent(self):
+        c, sent = self.client_recording_notifies()
+        with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:
+            f.write("int a;\n")
+            path = f.name
+        try:
+            c.did_open(path)
+            c.did_open(path)
+            c.did_open(path)
+            self.assertEqual(len(sent), 1, "re-sent an unchanged document")
+        finally:
+            os.unlink(path)
+
+    def test_edited_file_is_pushed_as_did_change(self):
+        """The regression this prevents: edit a file, re-query, and keep
+        getting answers about the old contents."""
+        c, sent = self.client_recording_notifies()
+        with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:
+            f.write("int a;\n")
+            path = f.name
+        try:
+            c.did_open(path)
+            # bump mtime as well as contents; some filesystems have coarse
+            # timestamps, so the size change is what makes this deterministic
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("int a;\nint b;\nint c;\n")
+            os.utime(path, (0, 0))
+            c.did_open(path)
+
+            self.assertEqual([m for m, _ in sent],
+                             ["textDocument/didOpen", "textDocument/didChange"])
+            change = sent[1][1]
+            self.assertEqual(change["contentChanges"][0]["text"],
+                             "int a;\nint b;\nint c;\n")
+            self.assertGreater(change["textDocument"]["version"], 1,
+                               "version must advance or clangd ignores the change")
+        finally:
+            os.unlink(path)
+
+    def test_edit_invalidates_cached_diagnostics(self):
+        """Diagnostics for the previous contents must not be handed back as
+        if they described the new ones."""
+        c, sent = self.client_recording_notifies()
+        with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:
+            f.write("int a;\n")
+            path = f.name
+        try:
+            uri = c._uri(path)
+            c.did_open(path)
+            c._store_diagnostics({"uri": uri, "diagnostics": [{"message": "old"}]})
+            self.assertTrue(c._diag_events[uri].is_set())
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("int a;\nint b;\n")
+            os.utime(path, (0, 0))
+            c.did_open(path)
+
+            self.assertNotIn(uri, c._diagnostics, "stale diagnostics survived an edit")
+            self.assertFalse(c._diag_events[uri].is_set())
+        finally:
+            os.unlink(path)
+
+
+class TestDiagnosticsCapture(unittest.TestCase):
+    """publishDiagnostics is unsolicited -- there is no request to correlate
+    it with, so it has to be caught as it arrives."""
+
+    def test_notification_is_stored_and_signalled(self):
+        c = blank_client()
+        c._store_diagnostics({"uri": "file:///repo/a.cpp",
+                              "diagnostics": [{"message": "boom"}]})
+        self.assertEqual(c._diagnostics["file:///repo/a.cpp"][0]["message"], "boom")
+        self.assertTrue(c._diag_events["file:///repo/a.cpp"].is_set())
+
+    def test_empty_list_still_counts_as_received(self):
+        """An empty publish is how clangd says 'clean' -- treating it as
+        'nothing arrived' would turn every clean file into a timeout."""
+        c = blank_client()
+        c._store_diagnostics({"uri": "file:///repo/a.cpp", "diagnostics": []})
+        self.assertTrue(c._diag_events["file:///repo/a.cpp"].is_set())
+        self.assertEqual(c._diagnostics["file:///repo/a.cpp"], [])
+
+    def test_notification_without_uri_is_ignored(self):
+        c = blank_client()
+        c._store_diagnostics({"diagnostics": []})
+        self.assertEqual(c._diagnostics, {})
+
+    def test_null_diagnostics_becomes_a_list(self):
+        c = blank_client()
+        c._store_diagnostics({"uri": "file:///repo/a.cpp", "diagnostics": None})
+        self.assertEqual(c._diagnostics["file:///repo/a.cpp"], [])
+
+    def test_reader_routes_publish_diagnostics(self):
+        """End to end through the transport: a framed notification must reach
+        the store, not be dropped as an unknown method."""
+        note = framed({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+                       "params": {"uri": "file:///repo/a.cpp",
+                                  "diagnostics": [{"message": "boom", "severity": 1}]}})
+        c = blank_client()
+        c.proc = fake_proc(stream=note)
+        c._reader()
+        self.assertIn("file:///repo/a.cpp", c._diagnostics)
