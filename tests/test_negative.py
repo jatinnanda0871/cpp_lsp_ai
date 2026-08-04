@@ -278,7 +278,10 @@ class TestHostileInputAgainstRealClangd(unittest.TestCase):
         from clangd_client import ClangdClient
         ccdir = support.CORPUS_BUILD_DIR
 
-        def factory(root):
+        def factory(root, request_timeout=None):
+            # Ignore the caller's timeout -- this suite wants a generous,
+            # fixed one regardless of what clangq_mcp.REQUEST_TIMEOUT_S is
+            # set to.
             return ClangdClient(root, compile_commands_dir=ccdir,
                                 clangd=CLANGD, request_timeout=30)
 

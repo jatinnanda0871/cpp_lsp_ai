@@ -182,6 +182,24 @@ class TestEmptyResultsAreReported(unittest.TestCase):
         self.assertIn("no class found", out.getvalue())
 
 
+class TestMissingDeclarationOutput(unittest.TestCase):
+    """A function with no separate declaration (no header, or clangd found
+    nothing) used to print '(decl :1)' -- indistinguishable from a real
+    location at line 1 of an unnamed file. It must say plainly that no
+    declaration was found instead."""
+
+    def test_no_declaration_is_stated_not_faked_as_a_location(self):
+        # FakeQueryClient defaults decl=None, so declaration_async resolves
+        # to nothing -- the exact shape textDocument/declaration returns for
+        # a function with no separate header declaration.
+        out = io.StringIO()
+        qe.run_query(FakeQueryClient(symbols=SYMBOL, docsym=[]), "refs", "Foo", 1, out=out)
+        text = out.getvalue()
+        self.assertIn("(decl: not found)", text)
+        self.assertNotIn("(decl :1)", text)
+        self.assertNotIn("(decl :", text)
+
+
 class TestDisplayPaths(unittest.TestCase):
     """Reported paths must depend on the repo root, never the process cwd:
     the MCP host chooses the server's working directory, so cwd-relative
@@ -446,6 +464,22 @@ class TestWarmIndexFastFail(unittest.TestCase):
         c.workspace_symbol("x")
         self.assertFalse(c._index_warm)
 
+    def test_macro_fallback_that_still_misses_does_not_take_the_full_deadline(self):
+        """The defining file is found and opened, but clangd still won't
+        show the macro (e.g. it's inside #if 0, or outside
+        compile_commands.json). That is not a cold-index problem, so
+        retrying every interval_s until the caller's full deadline (120s
+        from MCP) cannot fix it -- it must give up on a short leash instead."""
+        import time
+        c = self._client(False)
+        c.find_macro_definition_file = lambda name: __file__  # any real, openable path
+        c.did_open = lambda path: None
+        t0 = time.time()
+        self.assertEqual(c.resolve_macro("NOPE_MACRO", deadline_s=120, interval_s=1), [])
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 20,
+                        "stalled macro fallback took %.1fs, expected a bounded give-up" % elapsed)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
@@ -460,7 +494,7 @@ class TestCliAndDaemonDispatch(unittest.TestCase):
     """
 
     def _args(self, **kwargs):
-        defaults = dict(is_class=False, is_macro=False, mode="all", name="X",
+        defaults = dict(is_class=False, is_macro=False, command="all", name="X",
                         wait=10, include_decl=False, verbose=False,
                         root=".", ccdir=None, clangd="clangd", req_timeout=10,
                         no_daemon=False)
@@ -500,7 +534,7 @@ class TestCliAndDaemonDispatch(unittest.TestCase):
                          "daemon request dropped the symbol kind: %r" % sent)
 
     def test_daemon_dispatches_each_known_command(self):
-        for cmd in ("ping", "shutdown", "query"):
+        for cmd in ("ping", "shutdown", "query", "tool"):
             self.assertIn(cmd, qe.DAEMON_COMMANDS)
 
     def test_daemon_shutdown_stops_serving(self):
@@ -525,9 +559,130 @@ class TestCliAndDaemonDispatch(unittest.TestCase):
     def test_parser_accepts_every_declared_mode(self):
         parser = qe.build_parser()
         for mode in qe.QUERY_MODES:
-            self.assertEqual(parser.parse_args([mode, "sym"]).mode, mode)
+            self.assertEqual(parser.parse_args([mode, "sym"]).command, mode)
         for mode in qe.SESSION_MODES:
-            self.assertEqual(parser.parse_args([mode]).mode, mode)
+            self.assertEqual(parser.parse_args([mode]).command, mode)
+
+
+class TestCliToolsRegistry(unittest.TestCase):
+    """struct/search/outline/diagnostics/hover/incoming: the CLI subcommands
+    that mirror clangq_mcp.py's tools beyond plain refs/callers/all. One
+    table (CLI_TOOLS) drives the subparser, the in-process call, and the
+    daemon call, so this is where a new tool could silently go missing from
+    one of the three."""
+
+    EXPECTED_TOOLS = ("struct", "search", "outline", "diagnostics", "hover", "incoming")
+
+    def test_every_expected_tool_is_registered(self):
+        for name in self.EXPECTED_TOOLS:
+            self.assertIn(name, qe.CLI_TOOLS)
+            tool = qe.CLI_TOOLS[name]
+            self.assertTrue(callable(tool.configure))
+            self.assertTrue(callable(tool.args_to_kwargs))
+            self.assertTrue(callable(tool.as_string_fn))
+
+    def test_parser_accepts_every_cli_tool(self):
+        """Each subcommand parses with its minimal required arguments and
+        selects the right command."""
+        parser = qe.build_parser()
+        cases = {
+            "struct": ["struct", "Point"],
+            "search": ["search", "Backend"],
+            "outline": ["outline", "a.cpp"],
+            "diagnostics": ["diagnostics", "a.cpp"],
+            "hover": ["hover", "a.cpp", "10", "2"],
+            "incoming": ["incoming", "doThing"],
+        }
+        for name, argv in cases.items():
+            args = parser.parse_args(argv)
+            self.assertEqual(args.command, name)
+
+    def test_hover_coordinates_are_parsed_as_integers(self):
+        parser = qe.build_parser()
+        args = parser.parse_args(["hover", "a.cpp", "10", "2"])
+        self.assertEqual((args.line, args.col), (10, 2))
+
+    def test_args_to_kwargs_matches_as_string_fn_signature(self):
+        """A kwarg name that doesn't match the target function's parameter
+        name would raise TypeError only when actually run -- catch it here
+        instead, for every registered tool at once."""
+        import inspect
+        common = types.SimpleNamespace(
+            name="X", query="X", path="a.cpp", line=1, col=2,
+            kind=None, limit=10, severity="all", wait=5, verbose=False)
+        for name, tool in qe.CLI_TOOLS.items():
+            with self.subTest(name):
+                kwargs = tool.args_to_kwargs(common)
+                sig = inspect.signature(tool.as_string_fn)
+                try:
+                    sig.bind(client=object(), **kwargs)
+                except TypeError as e:
+                    self.fail("%s: args_to_kwargs produced %r, which does not "
+                             "bind to %s: %s" % (name, kwargs, tool.as_string_fn, e))
+
+    def test_daemon_tool_dispatches_to_the_right_tool(self):
+        calls = []
+        real = qe.CLI_TOOLS["struct"].as_string_fn
+        qe.CLI_TOOLS["struct"].as_string_fn = lambda client, **kw: calls.append(kw) or "STRUCT OUT"
+        try:
+            response, keep_serving = qe.DAEMON_COMMANDS["tool"](
+                "fake-client", {"tool": "struct", "kwargs": {"name": "Point", "wait": 1}},
+                types.SimpleNamespace(verbose=False))
+        finally:
+            qe.CLI_TOOLS["struct"].as_string_fn = real
+
+        self.assertTrue(keep_serving)
+        self.assertEqual(response.get("out"), "STRUCT OUT")
+        self.assertEqual(calls, [{"name": "Point", "wait": 1}])
+
+    def test_daemon_rejects_an_unknown_tool(self):
+        response, keep_serving = qe.DAEMON_COMMANDS["tool"](
+            None, {"tool": "bogus"}, types.SimpleNamespace(verbose=False))
+        self.assertIn("unknown tool", response.get("error", ""))
+        self.assertTrue(keep_serving, "a bad request must not stop the daemon")
+
+    def test_daemon_tool_reports_a_query_failure_without_raising(self):
+        real = qe.CLI_TOOLS["hover"].as_string_fn
+
+        def boom(client, **kw):
+            raise RuntimeError("clangd exploded")
+        qe.CLI_TOOLS["hover"].as_string_fn = boom
+        try:
+            response, keep_serving = qe.DAEMON_COMMANDS["tool"](
+                "fake-client", {"tool": "hover", "kwargs": {}},
+                types.SimpleNamespace(verbose=False))
+        finally:
+            qe.CLI_TOOLS["hover"].as_string_fn = real
+
+        self.assertTrue(keep_serving)
+        self.assertIn("clangd exploded", response.get("error", ""))
+
+    def test_daemon_tool_sender_round_trips_kwargs(self):
+        """The client-side counterpart to test_daemon_request_carries_the_
+        symbol_kind: what daemon_tool() sends must be exactly what the
+        server-side handler above expects to receive."""
+        sent = {}
+
+        class FakeConn:
+            def close(self):
+                pass
+
+        original_send, original_recv = qe._send_json, qe._recv_line
+        original_connect = qe._try_connect
+        qe._send_json = lambda conn, obj: sent.update(obj)
+        qe._recv_line = lambda conn: '{"out": ""}'
+        qe._try_connect = lambda sock_path: FakeConn()
+        try:
+            args = types.SimpleNamespace(
+                root=".", no_daemon=False, wait=7, verbose=False, name="Point")
+            qe.daemon_tool(args, qe.CLI_TOOLS["struct"])
+        finally:
+            qe._send_json, qe._recv_line = original_send, original_recv
+            qe._try_connect = original_connect
+
+        self.assertEqual(sent.get("cmd"), "tool")
+        self.assertEqual(sent.get("tool"), "struct")
+        self.assertEqual(sent.get("kwargs"), {"name": "Point", "wait": 7, "verbose": False})
 
 
 class TestHoverContentShapes(unittest.TestCase):
@@ -799,7 +954,7 @@ class FakeOutlineClient:
         self._error = error
         self.root = root
 
-    def document_symbol(self, path):
+    def document_symbol(self, path, timeout=None):
         if self._error:
             raise RuntimeError(self._error)
         return self._symbols

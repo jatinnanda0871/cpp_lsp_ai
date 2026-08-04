@@ -37,11 +37,19 @@ from clangd_query_engine import (
 )
 
 # ============================ tunables ============================
+# Per-request timeout given to ClangdClient -- bounds any SINGLE LSP round
+# trip (documentSymbol, references, etc.). Distinct from QUERY_WAIT_S below,
+# which bounds retrying workspace/symbol while the index warms. The CLI has
+# --req-timeout for this ("raise for heavy TUs"); MCP takes no CLI flags, so
+# an env var is the only way a host can raise it for a large repo.
+REQUEST_TIMEOUT_S = int(os.environ.get("CLANGQ_REQ_TIMEOUT", "30"))
+
 # Budget for a cold index on a large repo. ClangdClient cuts this short once
 # the index is serving, so a typo doesn't cost the full 120s.
 QUERY_WAIT_S = 120
 
-# Hover reads the open file's AST, no index needed.
+# Hover and the outline read the open file's AST -- no index needed, so they
+# don't need QUERY_WAIT_S's cold-index budget, just enough for one parse.
 HOVER_WAIT_S = 10
 
 # Diagnostics arrive unprompted once clangd finishes parsing the TU, so this
@@ -89,7 +97,7 @@ def get_client(root):
             client = None
 
         if client is None:
-            client = ClangdClient(root).start()
+            client = ClangdClient(root, request_timeout=REQUEST_TIMEOUT_S).start()
             client.prime_index()
             _clients[root] = client
         return client
@@ -200,13 +208,6 @@ def _validate_position(label, value):
     return None
 
 
-def _validate_flag(label, value):
-    if not isinstance(value, bool):
-        return "Error: %s must be true or false, got %s (%r)" % (
-            label, _type_name(value), value)
-    return None
-
-
 def _validate_kind(label, value):
     """Rejected rather than ignored: an unknown kind falling through to an
     unfiltered search returns results that quietly disregard the constraint
@@ -281,12 +282,6 @@ COL = Param(
     "col",
     {"type": "integer", "description": "Column number, 0-based"},
     validate=_validate_position, hint="a 0-based integer column number",
-)
-INCLUDE_DECL = Param(
-    "include_decl",
-    {"type": "boolean", "default": False,
-     "description": "Include the declaration in the references list"},
-    required=False, default=False, validate=_validate_flag,
 )
 SEARCH_QUERY = Param(
     "query",
@@ -423,11 +418,10 @@ def _get_macro_info(client, args):
     "get_struct_info",
     "Get the declaration location of a C/C++ struct, including a typedef "
     "struct.",
-    [ROOT, SYMBOL, INCLUDE_DECL],
+    [ROOT, SYMBOL],
 )
 def _get_struct_info(client, args):
-    return run_struct_query_as_string(
-        client, args["name"], QUERY_WAIT_S, include_decl=args["include_decl"])
+    return run_struct_query_as_string(client, args["name"], QUERY_WAIT_S)
 
 
 @_tool(

@@ -411,11 +411,11 @@ class ClangdClient:
             "position": {"line": line, "character": col},
         })
 
-    def document_symbol(self, path):
+    def document_symbol(self, path, timeout=None):
         uri = self.did_open(path)
         return self._request("textDocument/documentSymbol", {
             "textDocument": {"uri": uri},
-        }) or []
+        }, timeout=timeout) or []
 
     def document_symbol_async(self, path):
         uri = self.did_open(path)
@@ -541,7 +541,7 @@ class ClangdClient:
         return self._request_async("callHierarchy/incomingCalls", {"item": item})
 
     # ---- hover queries --------------------------------------------------------
-    def hover(self, path, line, col):
+    def hover(self, path, line, col, timeout=None):
         """Get hover information for a symbol at the given position.
 
         Returns:
@@ -552,7 +552,7 @@ class ClangdClient:
         return self._request("textDocument/hover", {
             "textDocument": {"uri": uri},
             "position": {"line": line, "character": col},
-        }) or None
+        }, timeout=timeout) or None
 
     # ---- struct queries --------------------------------------------------------
     def resolve_struct(self, name, deadline_s=10, interval_s=2):
@@ -619,6 +619,8 @@ class ClangdClient:
         "no macro found".
         """
         import time
+        if getattr(self, "_index_warm", False):
+            deadline_s = min(deadline_s, WARM_MISS_DEADLINE_S)
         end = time.time() + deadline_s
         attempt = 0
         tried_fallback = False
@@ -637,6 +639,14 @@ class ClangdClient:
                                          % (path, name))
                     try:
                         self.did_open(path)
+                        # The file is open now; if clangd still won't show
+                        # the macro, further waiting isn't giving a cold
+                        # index time to warm -- it's index-independent (an
+                        # #if 0'd definition, a file outside
+                        # compile_commands.json). Give it a warm-miss-sized
+                        # window rather than the full deadline the caller
+                        # passed in for a cold start.
+                        end = min(end, time.time() + WARM_MISS_DEADLINE_S)
                         continue  # re-ask immediately, no need to wait out the interval
                     except Exception as e:
                         if self.log:
