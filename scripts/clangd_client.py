@@ -13,9 +13,26 @@ Speaks LSP over stdio (JSON-RPC + Content-Length framing) and exposes:
 import sys
 import json
 import os
+import re
 import threading
 import subprocess
 import pathlib
+
+# ============================ tunables ============================
+# Once workspace/symbol has answered anything the index is serving, so a
+# further miss is almost certainly a typo. Callers pass long deadlines (the
+# MCP server uses 120s) for cold starts; cap a warm miss at this instead.
+WARM_MISS_DEADLINE_S = 5
+
+# clangd only reports a macro once its defining file is OPEN, and nothing in
+# the protocol says which file that is -- so on a miss we locate the #define
+# ourselves. These bound that scan on a large repo.
+MACRO_SCAN_EXTS = (".h", ".hpp", ".hh", ".hxx", ".inc", ".ipp", ".def",
+                   ".c", ".cc", ".cpp", ".cxx")
+MACRO_SCAN_SKIP_DIRS = (".git", ".cache", ".svn", ".hg", "build", "out",
+                        "node_modules", "__pycache__")
+MACRO_SCAN_MAX_FILES = 2000
+MACRO_SCAN_MAX_BYTES = 1 * 1024 * 1024
 
 class ClangdClient:
     def __init__(self, root, compile_commands_dir=None, clangd="clangd",
@@ -28,6 +45,7 @@ class ClangdClient:
         self._pending = {}
         self._pending_lock = threading.Lock()
         self._opened = set()
+        self._index_warm = False  # set once workspace/symbol returns anything
 
         args = [clangd, "--background-index" if background_index else "--background-index=0"]
         if compile_commands_dir:
@@ -59,18 +77,25 @@ class ClangdClient:
             return self._id
 
     def _request_async(self, method, params):
-        """Send a request and return a handle without waiting for the reply.
-        Sending never blocks on a response, so callers can fire many
-        requests before waiting on any of them -- clangd then works on them
-        concurrently instead of one full round-trip at a time. The reader
-        thread demultiplexes replies by id regardless of arrival order, so
-        this is safe to call repeatedly before any wait_result()."""
+        """Send a request, return a handle, don't wait.
+
+        Callers can fire many before awaiting any; clangd then works on them
+        concurrently. The reader demultiplexes replies by id, so arrival
+        order doesn't matter.
+        """
         rid = self._next_id()
         ev = threading.Event()
         holder = {}
         with self._pending_lock:
             self._pending[rid] = (ev, holder)
-        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        try:
+            self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        except Exception as e:
+            # clangd likely died: drop the pending entry (it will never get a
+            # reply) and raise something clearer than a raw BrokenPipeError.
+            with self._pending_lock:
+                self._pending.pop(rid, None)
+            raise RuntimeError("failed to send %s to clangd (process may have exited): %s" % (method, e))
         return (ev, holder, method)
 
     def wait_result(self, handle, timeout=None):
@@ -111,15 +136,21 @@ class ClangdClient:
             if ":" in line:
                 k, v = line.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
-        length = int(headers["content-length"])
+        raw_len = headers.get("content-length")
+        if raw_len is None:
+            raise RuntimeError("clangd sent a message with no Content-Length header")
+        try:
+            length = int(raw_len)
+        except ValueError:
+            raise RuntimeError("clangd sent a bad Content-Length: %r" % raw_len)
         body = self._read_exactly(length)
         if body is None:
             return None
         return json.loads(body.decode("utf-8"))
 
     def _fail_all_pending(self, reason):
-        """Wake every waiting request with an error instead of letting it
-        hang to the timeout. Called when the reader loop ends."""
+        """Wake every waiter with an error rather than letting it hang to
+        the timeout. Called when the reader loop ends."""
         with self._pending_lock:
             items = list(self._pending.items())
             self._pending.clear()
@@ -137,6 +168,8 @@ class ClangdClient:
                     rc = self.proc.poll()
                     reason = "clangd exited (code %s)" % rc if rc is not None else "clangd stream closed"
                     break
+                if not isinstance(msg, dict):
+                    continue
                 if "id" in msg and ("result" in msg or "error" in msg):
                     with self._pending_lock:
                         entry = self._pending.pop(msg["id"], None)
@@ -157,7 +190,7 @@ class ClangdClient:
                     if self.log:
                         sys.stderr.write("[clangd] %s %s\n" % (val.get("kind"), val.get("title", "")))
                 elif method == "window/logMessage" and self.log:
-                    sys.stderr.write("[clangd] " + msg["params"].get("message", "") + "\n")
+                    sys.stderr.write("[clangd] " + (msg.get("params") or {}).get("message", "") + "\n")
         except Exception as e:
             reason = "reader error: %r" % e
         finally:
@@ -193,6 +226,11 @@ class ClangdClient:
         self._notify("initialized", {})
         return self
 
+    def is_alive(self):
+        """Whether clangd is still running. Callers keeping a warm client
+        must check before reuse: once it exits, every later request fails."""
+        return self.proc is not None and self.proc.poll() is None
+
     def _uri(self, path):
         return pathlib.Path(path).resolve().as_uri()
 
@@ -200,8 +238,15 @@ class ClangdClient:
         uri = self._uri(path)
         if uri in self._opened:
             return uri
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read()
+        # Every query entry point funnels through here, so a bad path
+        # (typo, stale location from the index, a directory) would
+        # otherwise surface as a bare OSError with no indication of which
+        # file or which query caused it.
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            raise RuntimeError("cannot open source file %r: %s" % (path, e))
         self._notify("textDocument/didOpen", {
             "textDocument": {"uri": uri, "languageId": "cpp", "version": 1, "text": text},
         })
@@ -209,10 +254,11 @@ class ClangdClient:
         return uri
 
     def prime_index(self):
-        """Open one real source file from the compile DB. clangd only loads the
-        compilation database and enqueues background indexing once a file is
-        opened -- not from the handshake alone. Without this, workspace/symbol
-        stays empty and no .cache/clangd index is ever written."""
+        """Open one source file from the compile DB.
+
+        clangd only loads the DB and starts background indexing once a file
+        is opened -- the handshake alone leaves workspace/symbol empty.
+        """
         if not self._db_found:
             return None
         try:
@@ -222,16 +268,29 @@ class ClangdClient:
             if self.log:
                 sys.stderr.write("[clangq] could not read compile DB: %r\n" % e)
             return None
+        if not isinstance(entries, list):
+            if self.log:
+                sys.stderr.write("[clangq] compile DB is not a JSON array: %s\n" % self._db_path)
+            return None
         for ent in entries:
+            if not isinstance(ent, dict):
+                continue
             fpath = ent.get("file")
             if not fpath:
                 continue
             if not os.path.isabs(fpath):
-                fpath = os.path.normpath(os.path.join(ent.get("directory", self.root), fpath))
+                fpath = os.path.normpath(os.path.join(ent.get("directory") or self.root, fpath))
             if os.path.exists(fpath):
                 if self.log:
                     sys.stderr.write("[clangq] priming index by opening %s\n" % fpath)
-                self.did_open(fpath)
+                # Priming is best-effort: one unreadable entry shouldn't
+                # abort startup, since a later entry may well open fine.
+                try:
+                    self.did_open(fpath)
+                except Exception as e:
+                    if self.log:
+                        sys.stderr.write("[clangq] could not prime with %s (%s)\n" % (fpath, e))
+                    continue
                 return fpath
         if self.log:
             sys.stderr.write("[clangq] no openable source file found in compile DB\n")
@@ -269,7 +328,9 @@ class ClangdClient:
         node whose full range starts at start_line (top-level or nested,
         e.g. a method inside a class)."""
         for n in nodes:
-            if (n.get("range") or {}).get("start", {}).get("line") == start_line:
+            if not isinstance(n, dict):
+                continue
+            if ((n.get("range") or {}).get("start") or {}).get("line") == start_line:
                 return n
             found = self._find_node_by_range_start(n.get("children") or [], start_line)
             if found is not None:
@@ -289,11 +350,14 @@ class ClangdClient:
             # lookups need a position on the identifier, so use selectionRange.
             sel = child.get("selectionRange") or child.get("range") or {}
             rng = child.get("range") or {}
+            sel_start = sel.get("start") or {}
+            rng_end = rng.get("end") or {}
+            start_line = sel_start.get("line") or 0
             out.append({
                 "name": child.get("name"),
-                "start_line": sel.get("start", {}).get("line", 0),
-                "start_col": sel.get("start", {}).get("character", 0),
-                "end_line": rng.get("end", {}).get("line", sel.get("start", {}).get("line", 0)),
+                "start_line": start_line,
+                "start_col": sel_start.get("character") or 0,
+                "end_line": rng_end.get("line", start_line),
             })
         return out
 
@@ -305,7 +369,7 @@ class ClangdClient:
         class_node = self._find_node_by_range_start(symbols, class_start)
         if class_node is None:
             return None, []
-        end_line = (class_node.get("range") or {}).get("end", {}).get("line")
+        end_line = ((class_node.get("range") or {}).get("end") or {}).get("line")
         return end_line, self._find_class_methods(symbols, class_start)
 
     def end_line_from_document_symbol(self, symbols, start_line):
@@ -315,17 +379,25 @@ class ClangdClient:
         node = self._find_node_by_range_start(symbols or [], start_line)
         if node is None:
             return None
-        return (node.get("range") or {}).get("end", {}).get("line")
+        return ((node.get("range") or {}).get("end") or {}).get("line")
 
     def workspace_symbol(self, query):
         """Resolve a name via clangd's own index. Returns SymbolInformation[]."""
-        return self._request("workspace/symbol", {"query": query}) or []
+        syms = self._request("workspace/symbol", {"query": query}) or []
+        if syms:
+            self._index_warm = True
+        return syms
 
     def resolve_symbol(self, name, deadline_s=10, interval_s=2):
-        """Poll workspace/symbol until it returns hits or the deadline passes.
-        clangd's index fills in over time, so a cold start needs retries rather
-        than relying on a one-shot 'end' event."""
+        """Poll workspace/symbol until it hits or the deadline passes.
+
+        The index fills in over time, so a cold start needs retries. The full
+        deadline applies only while it might still be cold; see
+        WARM_MISS_DEADLINE_S.
+        """
         import time
+        if getattr(self, "_index_warm", False):
+            deadline_s = min(deadline_s, WARM_MISS_DEADLINE_S)
         end = time.time() + deadline_s
         attempt = 0
         while True:
@@ -390,6 +462,8 @@ class ClangdClient:
         Note: clangd indexes typedef struct as kind=5 (Class), not kind=13 (Struct).
         This method checks both kinds to find struct definitions."""
         import time
+        if getattr(self, "_index_warm", False):
+            deadline_s = min(deadline_s, WARM_MISS_DEADLINE_S)
         end = time.time() + deadline_s
         attempt = 0
         while True:
@@ -406,19 +480,75 @@ class ClangdClient:
             time.sleep(interval_s)
 
     # ---- macro queries --------------------------------------------------------
-    def resolve_macro(self, name, deadline_s=10, interval_s=2):
-        """Resolve a macro name via clangd's workspace/symbol index.
-        Returns SymbolInformation[] with kind=15 (Constant) matching the name.
+    def find_macro_definition_file(self, name):
+        """Find the file defining macro `name` under the repo root.
 
-        Note: clangd indexes #define macros as kind=15 (Constant), not kind=14 (Macro)."""
+        A fallback locator only (see resolve_macro): it tells clangd which
+        file to open. Every actual answer still comes from clangd.
+        """
+        pattern = re.compile(r"^\s*#\s*define\s+" + re.escape(name) + r"\b")
+        scanned = 0
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in MACRO_SCAN_SKIP_DIRS and not d.startswith(".")]
+            for fn in filenames:
+                if not fn.endswith(MACRO_SCAN_EXTS):
+                    continue
+                scanned += 1
+                if scanned > MACRO_SCAN_MAX_FILES:
+                    return None
+                full = os.path.join(dirpath, fn)
+                try:
+                    if os.path.getsize(full) > MACRO_SCAN_MAX_BYTES:
+                        continue
+                    with open(full, "r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            if pattern.match(line):
+                                return full
+                except OSError:
+                    continue
+        return None
+
+    def resolve_macro(self, name, deadline_s=10, interval_s=2):
+        """Resolve a macro. Returns SymbolInformation[] of kind=15.
+
+        clangd indexes #defines as kind=15 (Constant), not 14 (Macro), and
+        only reports one once its defining file is open -- the background
+        index never surfaces it. So on a miss: locate the #define, open that
+        file, ask again. Otherwise we burn the deadline and wrongly answer
+        "no macro found".
+        """
         import time
         end = time.time() + deadline_s
         attempt = 0
+        tried_fallback = False
         while True:
             syms = self.workspace_symbol(name)
             macros = [s for s in syms if s.get("kind") == 15]
             if macros:
                 return macros
+
+            if not tried_fallback:
+                tried_fallback = True
+                path = self.find_macro_definition_file(name)
+                if path:
+                    if self.log:
+                        sys.stderr.write("[clangq] opening %s so clangd can see macro %s\n"
+                                         % (path, name))
+                    try:
+                        self.did_open(path)
+                        continue  # re-ask immediately, no need to wait out the interval
+                    except Exception as e:
+                        if self.log:
+                            sys.stderr.write("[clangq] could not open %s (%s)\n" % (path, e))
+                else:
+                    # Nothing defines it under the root and clangd has no
+                    # record: waiting out the deadline cannot change that.
+                    if self.log:
+                        sys.stderr.write("[clangq] no '#define %s' found under %s\n"
+                                         % (name, self.root))
+                    return []
+
             if time.time() >= end:
                 return []
             attempt += 1
@@ -426,13 +556,40 @@ class ClangdClient:
                 sys.stderr.write("[clangq] no macro match yet, index warming (retry %d)...\n" % attempt)
             time.sleep(interval_s)
 
-    def shutdown(self):
+    def shutdown(self, timeout=10):
+        """Stop clangd and release its process and pipes.
+
+        A long-lived server replaces clients as they die, so leaks accumulate:
+        without wait() the child stays a zombie, without close() the fds leak.
+        """
+        if self.proc is None:
+            return
         try:
-            self._request("shutdown", None, timeout=10)
+            self._request("shutdown", None, timeout=timeout)
             self._notify("exit", {})
         except Exception:
             pass
+
+        # Let it exit on its own, then insist.
         try:
-            self.proc.terminate()
+            self.proc.wait(timeout=2)
         except Exception:
-            pass
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                    self.proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+        for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+
+        # Nothing will get a reply now.
+        self._fail_all_pending("clangd shut down")

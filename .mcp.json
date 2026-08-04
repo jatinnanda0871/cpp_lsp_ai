@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "clangq": {
+      "command": "python3",
+      "args": [
+        "D:\\git_repos\\cpp_lsp_ai\\scripts\\clangq_mcp.py"
+      ]
+    }
+  }
+}
