@@ -28,7 +28,6 @@ class ClangdClient:
         self._pending = {}
         self._pending_lock = threading.Lock()
         self._opened = set()
-        self._index_done = threading.Event()
 
         args = [clangd, "--background-index" if background_index else "--background-index=0"]
         if compile_commands_dir:
@@ -59,20 +58,33 @@ class ClangdClient:
             self._id += 1
             return self._id
 
-    def _request(self, method, params, timeout=None):
-        if timeout is None:
-            timeout = self.req_timeout
+    def _request_async(self, method, params):
+        """Send a request and return a handle without waiting for the reply.
+        Sending never blocks on a response, so callers can fire many
+        requests before waiting on any of them -- clangd then works on them
+        concurrently instead of one full round-trip at a time. The reader
+        thread demultiplexes replies by id regardless of arrival order, so
+        this is safe to call repeatedly before any wait_result()."""
         rid = self._next_id()
         ev = threading.Event()
         holder = {}
         with self._pending_lock:
             self._pending[rid] = (ev, holder)
         self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        return (ev, holder, method)
+
+    def wait_result(self, handle, timeout=None):
+        if timeout is None:
+            timeout = self.req_timeout
+        ev, holder, method = handle
         if not ev.wait(timeout):
             raise TimeoutError("clangd request timed out: " + method)
         if "error" in holder:
             raise RuntimeError("clangd error on %s: %s" % (method, holder["error"]))
         return holder.get("result")
+
+    def _request(self, method, params, timeout=None):
+        return self.wait_result(self._request_async(method, params), timeout)
 
     def _notify(self, method, params):
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
@@ -115,7 +127,6 @@ class ClangdClient:
             if "result" not in holder and "error" not in holder:
                 holder["error"] = reason
             ev.set()
-        self._index_done.set()  # also unblock wait_for_index
 
     def _reader(self):
         reason = "clangd stream closed"
@@ -145,8 +156,6 @@ class ClangdClient:
                     val = (msg.get("params") or {}).get("value") or {}
                     if self.log:
                         sys.stderr.write("[clangd] %s %s\n" % (val.get("kind"), val.get("title", "")))
-                    if val.get("kind") == "end":
-                        self._index_done.set()
                 elif method == "window/logMessage" and self.log:
                     sys.stderr.write("[clangd] " + msg["params"].get("message", "") + "\n")
         except Exception as e:
@@ -183,9 +192,6 @@ class ClangdClient:
         })
         self._notify("initialized", {})
         return self
-
-    def wait_for_index(self, timeout=300):
-        return self._index_done.wait(timeout)
 
     def _uri(self, path):
         return pathlib.Path(path).resolve().as_uri()
@@ -232,16 +238,16 @@ class ClangdClient:
         return None
 
     # ---- queries --------------------------------------------------------
-    def declaration(self, path, line, col):
+    def declaration_async(self, path, line, col):
         uri = self.did_open(path)
-        return self._request("textDocument/declaration", {
+        return self._request_async("textDocument/declaration", {
             "textDocument": {"uri": uri},
             "position": {"line": line, "character": col},
         })
 
-    def definition(self, path, line, col):
+    def definition_async(self, path, line, col):
         uri = self.did_open(path)
-        return self._request("textDocument/definition", {
+        return self._request_async("textDocument/definition", {
             "textDocument": {"uri": uri},
             "position": {"line": line, "character": col},
         })
@@ -251,6 +257,12 @@ class ClangdClient:
         return self._request("textDocument/documentSymbol", {
             "textDocument": {"uri": uri},
         }) or []
+
+    def document_symbol_async(self, path):
+        uri = self.did_open(path)
+        return self._request_async("textDocument/documentSymbol", {
+            "textDocument": {"uri": uri},
+        })
 
     def _find_node_by_range_start(self, nodes, start_line):
         """Recursively search a hierarchical DocumentSymbol[] tree for the
@@ -263,10 +275,6 @@ class ClangdClient:
             if found is not None:
                 return found
         return None
-
-    def get_class_methods(self, path, class_start, class_end):
-        symbols = self.document_symbol(path)
-        return self._find_class_methods(symbols, class_start)
 
     def _find_class_methods(self, symbols, class_start):
         class_node = self._find_node_by_range_start(symbols, class_start)
@@ -300,9 +308,11 @@ class ClangdClient:
         end_line = (class_node.get("range") or {}).get("end", {}).get("line")
         return end_line, self._find_class_methods(symbols, class_start)
 
-    def get_function_end_line(self, path, start_line):
-        symbols = self.document_symbol(path)
-        node = self._find_node_by_range_start(symbols, start_line)
+    def end_line_from_document_symbol(self, symbols, start_line):
+        """Given a documentSymbol result (from document_symbol/
+        document_symbol_async), find the end line of the node whose range
+        starts at start_line."""
+        node = self._find_node_by_range_start(symbols or [], start_line)
         if node is None:
             return None
         return (node.get("range") or {}).get("end", {}).get("line")
@@ -337,25 +347,26 @@ class ClangdClient:
             "context": {"includeDeclaration": include_decl},
         }) or []
 
-    def prepare_calls(self, path, line, col):
+    def references_async(self, path, line, col, include_decl=False):
+        uri = self.did_open(path)
+        return self._request_async("textDocument/references", {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+            "context": {"includeDeclaration": include_decl},
+        })
+
+    def prepare_calls_async(self, path, line, col):
         """Resolve the call-hierarchy anchor(s) at a position. Returns a list of
         CallHierarchyItem; empty if clangd can't resolve a callable here (e.g. the
         position is a declaration without a definition, a macro, or a type)."""
         uri = self.did_open(path)
-        return self._request("textDocument/prepareCallHierarchy", {
+        return self._request_async("textDocument/prepareCallHierarchy", {
             "textDocument": {"uri": uri},
             "position": {"line": line, "character": col},
-        }) or []
+        })
 
-    def incoming(self, item):
-        return [c["from"] for c in
-                (self._request("callHierarchy/incomingCalls", {"item": item}) or [])]
-
-    def callers(self, path, line, col):
-        out = []
-        for item in self.prepare_calls(path, line, col):
-            out += self.incoming(item)
-        return out
+    def incoming_async(self, item):
+        return self._request_async("callHierarchy/incomingCalls", {"item": item})
 
     # ---- hover queries --------------------------------------------------------
     def hover(self, path, line, col):

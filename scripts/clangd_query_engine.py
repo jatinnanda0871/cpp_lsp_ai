@@ -70,61 +70,46 @@ def resolve_position(client, name, wait, verbose):
         for s in symbols:
             sys.stderr.write("  %s\n" % item_str(s))
 
-    results = []
+    items = []
     for sym in symbols:
         loc = sym.get("location") or {}
         path = uri_to_path(loc.get("uri", ""))
         if path and not os.path.exists(path):
             path = os.path.join(client.root, path)
         start = (loc.get("range") or {}).get("start", {"line": 0, "character": 0})
-        end = client.get_function_end_line(path, start.get("line", 0))
+        items.append({
+            "path": path,
+            "line": start.get("line", 0),
+            "col": start.get("character", 0),
+        })
 
-        # For getting function declaration info
-        decl = client.declaration(path, start.get("line", 0), start.get("character", 0))
+    # documentSymbol (for the end line) and declaration() don't depend on
+    # each other's results, so fire both for every candidate before waiting
+    # on either -- same fire-then-collect pattern used for
+    # class queries, just applied here even for the common single-candidate
+    # case, since there's no reason those two round-trips should be serial.
+    for it in items:
+        it["doc_handle"] = client.document_symbol_async(it["path"])
+        it["decl_handle"] = client.declaration_async(it["path"], it["line"], it["col"])
+
+    results = []
+    for it in items:
+        try:
+            doc_symbols = client.wait_result(it["doc_handle"])
+        except Exception:
+            doc_symbols = []
+        end = client.end_line_from_document_symbol(doc_symbols, it["line"])
+
+        try:
+            decl = client.wait_result(it["decl_handle"])
+        except Exception:
+            decl = None
         decl_path = uri_to_path(decl[0].get("uri", "")) if decl else ""
         decl_line = decl[0].get("range", {}).get("start", {}).get("line", 0) if decl else 0
 
-        results.append((path, start.get("line", 0), start.get("character", 0), end, decl_path, decl_line))
+        results.append((it["path"], it["line"], it["col"], end, decl_path, decl_line))
 
     return results
-
-def show_refs(client, name, path, line, col, include_decl, out):
-    try:
-        refs = client.references(path, line, col, include_decl)
-    except Exception as e:
-        print("  references: query failed (%s)" % e, file=out)
-        return
-    print("%d references of %s" % (len(refs), name), file=out)
-    for l in refs:
-        print("  " + loc_str(l), file=out)
-
-def show_calls(client, name, path, line, col, direction, out):
-    """Show call hierarchy (incoming calls only).
-
-    direction must be 'callers' - outgoing calls are not supported by this clangd version.
-    """
-    if direction != "callers":
-        print("  %s: call hierarchy (outgoing) is not supported by this clangd version" % direction, file=out)
-        print("    (only incoming calls are available)", file=out)
-        return
-    try:
-        anchors = client.prepare_calls(path, line, col)
-    except Exception as e:
-        print("  %s: could not resolve call hierarchy (%s)" % (direction, e), file=out)
-        return
-    if not anchors:
-        print("  %s: no definition found at %s:%d" % (direction, path, line + 1), file=out)
-        print("    (symbol may be a declaration without a body, a macro, a type, or an overload set)", file=out)
-        return
-    results = []
-    for item in anchors:
-        try:
-            results += client.incoming(item)
-        except Exception as e:
-            pass
-    print("%d %s of %s" % (len(results), direction, name), file=out)
-    for i in results:
-        print("  " + item_str(i), file=out)
 
 def run_class_query(client, mode, name, wait, include_decl=False, verbose=False, out=None):
     out = out or sys.stdout
@@ -159,46 +144,134 @@ def run_class_query(client, mode, name, wait, include_decl=False, verbose=False,
     # declaration span). For classes declared in a header with bodies
     # out-of-line in a .cpp, that position is the declaration only -- it has
     # no body, so anchoring refs/callers there directly would make
-    # prepareCallHierarchy come back empty. Ask clangd for the definition
-    # from that known position instead: one deterministic LSP call, no
-    # fuzzy workspace/symbol search on the qualified "Class::method" string
-    # (which is what caused the retry-sleep latency previously -- clangd's
-    # fuzzy index matches unqualified names and often misses a
-    # "::"-qualified query on the first poll).
-    for method in methods:
-        method_name = name + "::" + method.get("name")
-        print("\n--- Class Method: %s ---" % method_name, file=out)
+    # prepareCallHierarchy come back empty, so we resolve the definition
+    # first via textDocument/definition.
+    #
+    # All of this is pipelined across every method instead of done one
+    # method at a time: sending a request doesn't block on its reply, and
+    # clangd can work on many read-only queries concurrently, so each phase
+    # below fires every method's request before waiting on any of them.
+    items = [{
+        "method_name": name + "::" + method.get("name"),
+        "decl_path": path,  # methods are children of the class, same file
+        "decl_line": method.get("start_line", 0),
+        "decl_col": method.get("start_col", 0),
+        "decl_end": method.get("end_line", method.get("start_line", 0)),
+    } for method in methods]
+
+    # Phase 1: definition() for every method.
+    for it in items:
+        it["def_handle"] = client.definition_async(it["decl_path"], it["decl_line"], it["decl_col"])
+    for it in items:
         try:
-            decl_path = path  # methods are children of the class, same file
-            decl_line = method.get("start_line", 0)
-            decl_col = method.get("start_col", 0)
+            defs = client.wait_result(it["def_handle"])
+        except Exception:
+            defs = None
+        if defs:
+            d0 = defs[0]
+            def_range = d0.get("range") or {}
+            it["def_path"] = uri_to_path(d0.get("uri", "")) or it["decl_path"]
+            it["def_line"] = def_range.get("start", {}).get("line", it["decl_line"])
+            it["def_col"] = def_range.get("start", {}).get("character", it["decl_col"])
+            # textDocument/definition's own range is often just the identifier's
+            # line, not the whole body -- fall back to that for now, refined
+            # below with the full documentSymbol extent (same "end" semantics
+            # as a plain get_function_info query).
+            it["def_end"] = def_range.get("end", {}).get("line", it["def_line"])
+        else:
+            # No separate body found (e.g. pure virtual): fall back to the
+            # declaration itself so callers still get something.
+            it["def_path"], it["def_line"], it["def_col"] = it["decl_path"], it["decl_line"], it["decl_col"]
+            it["def_end"] = it["decl_end"]
 
+    # Phase 1b: refine def_end to the full body span via documentSymbol on
+    # the definition's file -- fetched once per unique file (methods of one
+    # class are typically all defined in the same .cpp) rather than once per
+    # method, and kept consistent with how a plain get_function_info query
+    # reports its "end" line.
+    doc_handles = {}
+    for it in items:
+        if it["def_path"] not in doc_handles:
+            doc_handles[it["def_path"]] = client.document_symbol_async(it["def_path"])
+    doc_symbols = {}
+    for def_path, handle in doc_handles.items():
+        try:
+            doc_symbols[def_path] = client.wait_result(handle)
+        except Exception:
+            doc_symbols[def_path] = []
+    for it in items:
+        end = client.end_line_from_document_symbol(doc_symbols.get(it["def_path"]), it["def_line"])
+        if end is not None:
+            it["def_end"] = end
+
+    # Phase 2: references() and prepareCallHierarchy(), anchored on the
+    # resolved definition, for every method.
+    for it in items:
+        if mode in ("refs", "all"):
             try:
-                defs = client.definition(decl_path, decl_line, decl_col)
-            except Exception:
-                defs = None
-            if defs:
-                d0 = defs[0]
-                def_path = uri_to_path(d0.get("uri", "")) or decl_path
-                def_range = d0.get("range") or {}
-                def_line = def_range.get("start", {}).get("line", decl_line)
-                def_col = def_range.get("start", {}).get("character", decl_col)
-                def_end = def_range.get("end", {}).get("line", def_line)
-            else:
-                # No separate body found (e.g. pure virtual): fall back to
-                # the declaration itself so callers still get something.
-                def_path, def_line, def_col = decl_path, decl_line, decl_col
-                def_end = method.get("end_line", decl_line)
+                it["refs_handle"] = client.references_async(it["def_path"], it["def_line"], it["def_col"], include_decl)
+            except Exception as e:
+                it["refs_error"] = e
+        if mode in ("callers", "all"):
+            try:
+                it["calls_handle"] = client.prepare_calls_async(it["def_path"], it["def_line"], it["def_col"])
+            except Exception as e:
+                it["calls_error"] = e
+    for it in items:
+        if "refs_handle" in it:
+            try:
+                it["refs"] = client.wait_result(it["refs_handle"]) or []
+            except Exception as e:
+                it["refs_error"] = e
+        if "calls_handle" in it:
+            try:
+                it["anchors"] = client.wait_result(it["calls_handle"]) or []
+            except Exception as e:
+                it["calls_error"] = e
 
-            print("# %s  (def %s:%d-%d)" % (method_name, def_path, def_line + 1, def_end + 1), file=out)
-            print("# %s  (decl %s:%d)" % (method_name, decl_path, decl_line + 1), file=out)
-            if mode in ("refs", "all"):
-                show_refs(client, method_name, def_path, def_line, def_col, include_decl, out)
-            if mode in ("callers", "all"):
-                show_calls(client, method_name, def_path, def_line, def_col, "callers", out)
-            print("", file=out)
-        except Exception as e:
-            print("  failed for %s (%s)" % (method_name, e), file=out)
+    # Phase 3: incomingCalls() for every anchor found above.
+    for it in items:
+        if it.get("anchors"):
+            it["incoming_handles"] = [client.incoming_async(a) for a in it["anchors"]]
+    for it in items:
+        if "incoming_handles" not in it:
+            continue
+        callers = []
+        for h in it["incoming_handles"]:
+            try:
+                callers += [c["from"] for c in (client.wait_result(h) or [])]
+            except Exception:
+                pass
+        it["callers"] = callers
+
+    # Assemble the output, in the original method order.
+    for it in items:
+        method_name = it["method_name"]
+        print("\n--- Class Method: %s ---" % method_name, file=out)
+        print("# %s  (def %s:%d-%d)" % (method_name, it["def_path"], it["def_line"] + 1, it["def_end"] + 1), file=out)
+        print("# %s  (decl %s:%d)" % (method_name, it["decl_path"], it["decl_line"] + 1), file=out)
+
+        if mode in ("refs", "all"):
+            if "refs_error" in it:
+                print("  references: query failed (%s)" % it["refs_error"], file=out)
+            else:
+                refs = it.get("refs") or []
+                print("%d references of %s" % (len(refs), method_name), file=out)
+                for r in refs:
+                    print("  " + loc_str(r), file=out)
+
+        if mode in ("callers", "all"):
+            if "calls_error" in it:
+                print("  callers: could not resolve call hierarchy (%s)" % it["calls_error"], file=out)
+            elif not it.get("anchors"):
+                print("  callers: no definition found at %s:%d" % (it["def_path"], it["def_line"] + 1), file=out)
+                print("    (symbol may be a declaration without a body, a macro, a type, or an overload set)", file=out)
+            else:
+                callers = it.get("callers") or []
+                print("%d callers of %s" % (len(callers), method_name), file=out)
+                for c in callers:
+                    print("  " + item_str(c), file=out)
+        print("", file=out)
 
 def run_query(client, mode, name, wait, include_decl=False, verbose=False, out=None):
     out = out or sys.stdout
@@ -210,13 +283,75 @@ def run_query(client, mode, name, wait, include_decl=False, verbose=False, out=N
     if pos is None:
         print("  no symbol matching %r (raise --wait, or check --ccdir)" % name, file=out)
         return
-    for path, line, col, end, decl_path, decl_line in pos:
-        print("# %s  (def %s:%d-%d)" % (name, path, line + 1, end + 1), file=out)
-        print("# %s  (decl %s:%d)" % (name, decl_path, decl_line + 1), file=out)
+
+    items = [{"path": p, "line": l, "col": c, "end": e, "decl_path": dp, "decl_line": dl}
+             for (p, l, c, e, dp, dl) in pos]
+
+    # references() and prepareCallHierarchy() don't depend on each other, so
+    # fire both for every position before waiting on either (same pattern as
+    # run_class_query -- there's usually just one position here, but the two
+    # calls still don't need to be serial).
+    for it in items:
         if mode in ("refs", "all"):
-            show_refs(client, name, path, line, col, include_decl, out)
+            try:
+                it["refs_handle"] = client.references_async(it["path"], it["line"], it["col"], include_decl)
+            except Exception as e:
+                it["refs_error"] = e
         if mode in ("callers", "all"):
-            show_calls(client, name, path, line, col, "callers", out)
+            try:
+                it["calls_handle"] = client.prepare_calls_async(it["path"], it["line"], it["col"])
+            except Exception as e:
+                it["calls_error"] = e
+    for it in items:
+        if "refs_handle" in it:
+            try:
+                it["refs"] = client.wait_result(it["refs_handle"]) or []
+            except Exception as e:
+                it["refs_error"] = e
+        if "calls_handle" in it:
+            try:
+                it["anchors"] = client.wait_result(it["calls_handle"]) or []
+            except Exception as e:
+                it["calls_error"] = e
+
+    for it in items:
+        if it.get("anchors"):
+            it["incoming_handles"] = [client.incoming_async(a) for a in it["anchors"]]
+    for it in items:
+        if "incoming_handles" not in it:
+            continue
+        callers = []
+        for h in it["incoming_handles"]:
+            try:
+                callers += [c["from"] for c in (client.wait_result(h) or [])]
+            except Exception:
+                pass
+        it["callers"] = callers
+
+    for it in items:
+        print("# %s  (def %s:%d-%d)" % (name, it["path"], it["line"] + 1, it["end"] + 1), file=out)
+        print("# %s  (decl %s:%d)" % (name, it["decl_path"], it["decl_line"] + 1), file=out)
+
+        if mode in ("refs", "all"):
+            if "refs_error" in it:
+                print("  references: query failed (%s)" % it["refs_error"], file=out)
+            else:
+                refs = it.get("refs") or []
+                print("%d references of %s" % (len(refs), name), file=out)
+                for r in refs:
+                    print("  " + loc_str(r), file=out)
+
+        if mode in ("callers", "all"):
+            if "calls_error" in it:
+                print("  callers: could not resolve call hierarchy (%s)" % it["calls_error"], file=out)
+            elif not it.get("anchors"):
+                print("  callers: no definition found at %s:%d" % (it["path"], it["line"] + 1), file=out)
+                print("    (symbol may be a declaration without a body, a macro, a type, or an overload set)", file=out)
+            else:
+                callers = it.get("callers") or []
+                print("%d callers of %s" % (len(callers), name), file=out)
+                for c in callers:
+                    print("  " + item_str(c), file=out)
         print("", file=out)
 
 # ========================= Wrapper for MCP =============================
@@ -414,8 +549,44 @@ def run_incoming_calls_query(client, name, wait, verbose=False, out=None):
     if not pos:
         print("  no definition found for %r" % name, file=out)
         return
-    for path, line, col, end, decl_path, decl_line in pos:
-        show_calls(client, name, path, line, col, "callers", out)
+
+    items = [{"path": p, "line": l, "col": c} for (p, l, c, _end, _dp, _dl) in pos]
+    for it in items:
+        try:
+            it["calls_handle"] = client.prepare_calls_async(it["path"], it["line"], it["col"])
+        except Exception as e:
+            it["calls_error"] = e
+    for it in items:
+        if "calls_handle" in it:
+            try:
+                it["anchors"] = client.wait_result(it["calls_handle"]) or []
+            except Exception as e:
+                it["calls_error"] = e
+    for it in items:
+        if it.get("anchors"):
+            it["incoming_handles"] = [client.incoming_async(a) for a in it["anchors"]]
+    for it in items:
+        if "incoming_handles" not in it:
+            continue
+        callers = []
+        for h in it["incoming_handles"]:
+            try:
+                callers += [c["from"] for c in (client.wait_result(h) or [])]
+            except Exception:
+                pass
+        it["callers"] = callers
+
+    for it in items:
+        if "calls_error" in it:
+            print("  callers: could not resolve call hierarchy (%s)" % it["calls_error"], file=out)
+        elif not it.get("anchors"):
+            print("  callers: no definition found at %s:%d" % (it["path"], it["line"] + 1), file=out)
+            print("    (symbol may be a declaration without a body, a macro, a type, or an overload set)", file=out)
+        else:
+            callers = it.get("callers") or []
+            print("%d callers of %s" % (len(callers), name), file=out)
+            for c in callers:
+                print("  " + item_str(c), file=out)
 
 def run_incoming_calls_query_as_string(client, name, wait=120, verbose=False):
     out = io.StringIO()
