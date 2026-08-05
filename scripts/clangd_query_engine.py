@@ -29,6 +29,7 @@ import hashlib
 import tempfile
 import getpass
 import argparse
+import threading
 import subprocess
 from urllib.parse import urlparse, unquote
 
@@ -535,30 +536,48 @@ def run_macro_query(client, mode, name, wait, include_decl=False, verbose=False,
         for m in macros:
             sys.stderr.write("  %s\n" % item_str(m, base))
 
+    # Fire every macro's references request before awaiting any -- clangd
+    # serves read-only queries concurrently, so N matches cost ~1 round-trip
+    # instead of N. Same two-phase shape as fetch_refs_and_callers.
+    items = []
     for macro_sym in macros:
         loc = macro_sym.get("location") or {}
         path = uri_to_path(loc.get("uri", ""))
         start = (loc.get("range") or {}).get("start") or {}
         line = start.get("line") or 0
         col = start.get("character") or 0
-
         # the symbol's OWN name -- a fuzzy hit would otherwise claim a macro
         # exists under the name that was asked for
-        found_name = macro_sym.get("name") or name
+        it = {"path": path, "line": line,
+              "found_name": macro_sym.get("name") or name,
+              "detail": macro_sym.get("detail", "")}
+        try:
+            it["refs_handle"] = client.references_async(path, line, col, include_decl)
+        except Exception as e:
+            it["refs_error"] = e
+        items.append(it)
+
+    for it in items:
+        if "refs_handle" in it:
+            try:
+                it["refs"] = client.wait_result(it.pop("refs_handle")) or []
+            except Exception as e:
+                it["refs_error"] = e
+
+    for it in items:
+        path, line, found_name = it["path"], it["line"], it["found_name"]
         print("# %s (macro decl %s:%d)"
               % (found_name, display_path(path, base), line + 1), file=out)
 
-        detail = macro_sym.get("detail", "")
-        if detail:
-            print("#   detail: %s" % detail, file=out)
+        if it["detail"]:
+            print("#   detail: %s" % it["detail"], file=out)
 
-        try:
-            refs = client.references(path, line, col, include_decl)
-        except Exception as e:
-            print("  references: query failed (%s)" % e, file=out)
+        if "refs_error" in it:
+            print("  references: query failed (%s)" % it["refs_error"], file=out)
             print("", file=out)
             continue
 
+        refs = it["refs"]
         # clangd doesn't index macro EXPANSION sites, so this returns the
         # #define and little else. A bare count reads as "unused".
         if not _expansion_sites(refs, path, line):
@@ -1350,7 +1369,15 @@ def _cmd_tool(client, req, args):
 
 
 def serve(args):
-    """Run the per-repo daemon: one warm clangd, many short-lived clients."""
+    """Run the per-repo daemon: one warm clangd, many concurrent clients.
+
+    Each accepted connection is handed to its own worker thread (see
+    _accept_loop) rather than handled one at a time in the accept loop --
+    ClangdClient already pipelines concurrent LSP requests (see
+    _request_async's docstring, and the _send framing invariant documented
+    on ClangdClient._send), so a slow query from one caller must not block
+    every other CLI invocation against this daemon for its whole duration.
+    """
     sock_path, _ = _paths(args.root)
     if _ping(sock_path):
         if args.verbose:
@@ -1379,10 +1406,13 @@ def serve(args):
         sys.stderr.write("[daemon] clangd warm; ready for queries\n")
 
     try:
-        while _serve_one(srv, client, args):
-            pass
+        _accept_loop(srv, client, args, sock_path)
     finally:
         client.shutdown()
+        try:
+            srv.close()
+        except OSError:
+            pass
         try:
             os.unlink(sock_path)
         except OSError:
@@ -1391,43 +1421,88 @@ def serve(args):
             sys.stderr.write("[daemon] stopped\n")
 
 
-def _serve_one(srv, client, args):
-    """Answer one connection. Returns False to stop serving.
+def _accept_loop(srv, client, args, sock_path):
+    """Accept connections and hand each to its own worker thread, until a
+    "shutdown" command sets `stop_event` (see _serve_one/_signal_stop).
+
+    accept() blocks, so a stop_event alone would leave this loop waiting
+    forever for one more connection that may never arrive -- _signal_stop
+    also opens a throwaway connection to this same socket to wake it.
+    """
+    stop_event = threading.Event()
+    while not stop_event.is_set():
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            break  # e.g. the socket was closed out from under us
+        if stop_event.is_set():
+            # A real client can race the wake connection into the accept
+            # backlog. Best-effort courtesy, not a guarantee -- whether
+            # this loop notices stop_event here or exits one line up via
+            # the while-condition (skipping this entirely) is itself a
+            # race. Either way the client must not crash: see
+            # _recv_daemon_response, the actual backstop.
+            try:
+                _send_json(conn, {"error": "daemon is shutting down"})
+            except Exception:
+                pass
+            conn.close()
+            break
+        threading.Thread(target=_serve_one, args=(conn, client, args, stop_event, sock_path),
+                         daemon=True).start()
+
+
+def _serve_one(conn, client, args, stop_event, sock_path):
+    """Answer one already-accepted connection, on its own thread.
 
     A bad request must not kill the daemon -- it outlives its clients, so
     anything unhandled here strands the warm index.
     """
-    conn, _ = srv.accept()
     try:
         line = _recv_line(conn)
         if not line:
-            return True
+            return
         try:
             req = json.loads(line)
         except ValueError as e:
             _send_json(conn, {"error": "malformed request (%s)" % e})
-            return True
+            return
         if not isinstance(req, dict):
             _send_json(conn, {"error": "request must be a JSON object"})
-            return True
+            return
 
         handler = DAEMON_COMMANDS.get(req.get("cmd"))
         if handler is None:
             _send_json(conn, {"error": "unknown cmd %r (known: %s)"
                               % (req.get("cmd"), ", ".join(sorted(DAEMON_COMMANDS)))})
-            return True
+            return
 
         response, keep_serving = handler(client, req, args)
         _send_json(conn, response)
-        return keep_serving
+        if not keep_serving:
+            _signal_stop(stop_event, sock_path)
     except Exception as e:
         try:
             _send_json(conn, {"error": "daemon error: %r" % e})
         except Exception:
             pass
-        return True
     finally:
         conn.close()
+
+
+def _signal_stop(stop_event, sock_path):
+    """Set `stop_event` and wake the accept loop out of its blocking
+    accept() so it notices promptly instead of waiting for a connection
+    that may never come."""
+    stop_event.set()
+    try:
+        wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            wake.connect(sock_path)
+        finally:
+            wake.close()
+    except OSError:
+        pass
 
 
 # ===================== daemon client =====================
@@ -1446,6 +1521,21 @@ def _start_daemon(args, log_path):
     logf = open(log_path, "a")
     subprocess.Popen(cmd, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
                      start_new_session=True)
+
+
+def _recv_daemon_response(conn):
+    """Read and parse one daemon response line.
+
+    A daemon that closes the connection without answering (e.g. a client
+    connection racing an explicit `stop` into the accept backlog) leaves
+    _recv_line returning "" here, which json.loads("") raises on -- report
+    that as cleanly as any other daemon-side error, not a raw traceback.
+    """
+    try:
+        return json.loads(_recv_line(conn))
+    except ValueError:
+        return {"error": "no valid response from the daemon "
+                         "(it may have shut down mid-request; retry)"}
 
 
 def daemon_query(args):
@@ -1467,7 +1557,7 @@ def daemon_query(args):
             "wait": args.wait,
             "include_decl": args.include_decl,
         })
-        resp = json.loads(_recv_line(conn))
+        resp = _recv_daemon_response(conn)
     finally:
         conn.close()
 
@@ -1495,7 +1585,7 @@ def daemon_tool(args, tool):
             "tool": tool.name,
             "kwargs": tool.args_to_kwargs(args),
         })
-        resp = json.loads(_recv_line(conn))
+        resp = _recv_daemon_response(conn)
     finally:
         conn.close()
 
@@ -1513,7 +1603,7 @@ def stop(args):
         return
     try:
         _send_json(conn, {"cmd": "shutdown"})
-        json.loads(_recv_line(conn))
+        _recv_daemon_response(conn)
         print("daemon stopped")
     finally:
         conn.close()
