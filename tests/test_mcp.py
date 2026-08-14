@@ -21,6 +21,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import support  # noqa: E402  (needs the path set up first)
+import clangd_query_engine as qe  # noqa: E402  (no mcp dependency, always available)
 
 try:
     import clangq_mcp
@@ -203,8 +204,9 @@ class TestWarmClientCache(unittest.TestCase):
         outer = self
 
         class FakeClangd:
-            def __init__(self, root):
+            def __init__(self, root, request_timeout=None):
                 self.root = root
+                self.request_timeout = request_timeout
                 self._alive = True
                 self.shutdown_called = False
                 outer.created.append(self)
@@ -243,6 +245,13 @@ class TestWarmClientCache(unittest.TestCase):
 
     def test_distinct_roots_get_distinct_clients(self):
         self.assertIsNot(clangq_mcp.get_client("/repoA"), clangq_mcp.get_client("/repoB"))
+
+    def test_client_gets_a_real_per_request_timeout(self):
+        """MCP takes no --req-timeout flag, so ClangdClient's own 10s default
+        silently capped every request until this was wired through -- see
+        REQUEST_TIMEOUT_S."""
+        client = clangq_mcp.get_client("/repoA")
+        self.assertEqual(client.request_timeout, clangq_mcp.REQUEST_TIMEOUT_S)
 
     def test_locks_are_per_root(self):
         a = clangq_mcp._lock_for("/repoA")
@@ -286,6 +295,59 @@ class TestWarmClientCache(unittest.TestCase):
         gate.set()
         slow.join(5)
         self.assertTrue(got_through, "a cold start on one root blocked another root")
+
+
+@unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed: %s" % MCP_IMPORT_ERROR)
+class TestCliMatchesMcpFeatureSet(unittest.TestCase):
+    """clangd_query_engine.py (the CLI) and clangq_mcp.py (the MCP server)
+    are two front ends on the same query engine. A query reachable from one
+    but not the other defeats the point of shipping both, so this pins every
+    MCP tool to a CLI equivalent and checks it's not just same-named but
+    reaches the identical engine function."""
+
+    # get_function_info/get_class_info/get_macro_info are reached through the
+    # CLI's refs/callers/all subcommands plus --class/--macro (QUERY_KINDS),
+    # not a same-named CLI_TOOLS entry.
+    COVERED_BY_QUERY_KINDS = {"get_function_info", "get_class_info", "get_macro_info"}
+
+    # mcp tool name -> (CLI subcommand name, engine *_as_string function name)
+    MCP_TOOL_TO_CLI_TOOL = {
+        "get_struct_info": ("struct", "run_struct_query_as_string"),
+        "search_symbols": ("search", "run_search_query_as_string"),
+        "get_file_outline": ("outline", "run_outline_query_as_string"),
+        "get_diagnostics": ("diagnostics", "run_diagnostics_query_as_string"),
+        "get_hover_info": ("hover", "run_hover_query_as_string"),
+        "get_incoming_calls": ("incoming", "run_incoming_calls_query_as_string"),
+    }
+
+    def test_every_mcp_tool_has_a_cli_equivalent(self):
+        missing = [t for t in clangq_mcp.TOOLS
+                  if t not in self.COVERED_BY_QUERY_KINDS
+                  and t not in self.MCP_TOOL_TO_CLI_TOOL]
+        self.assertEqual(missing, [], "MCP tools with no known CLI subcommand: %s" % missing)
+
+        for mcp_name, (cli_name, _) in self.MCP_TOOL_TO_CLI_TOOL.items():
+            self.assertIn(mcp_name, clangq_mcp.TOOLS, "%s is not an MCP tool" % mcp_name)
+            self.assertIn(cli_name, qe.CLI_TOOLS, "%s has no CLI subcommand" % cli_name)
+
+    def test_no_cli_tool_is_left_out_of_the_mapping(self):
+        """Catches the mirror mistake: a CLI subcommand added without a
+        matching entry above, which would let it silently drift from MCP."""
+        self.assertEqual(set(qe.CLI_TOOLS),
+                         {cli for cli, _ in self.MCP_TOOL_TO_CLI_TOOL.values()})
+
+    def test_mapped_tools_call_the_same_engine_function(self):
+        """Same name is not the same feature -- both front ends must call
+        the identical *_as_string function, or their answers could diverge."""
+        import inspect
+        for mcp_name, (cli_name, fn_name) in self.MCP_TOOL_TO_CLI_TOOL.items():
+            with self.subTest(mcp_name):
+                engine_fn = getattr(qe, fn_name)
+                self.assertIs(qe.CLI_TOOLS[cli_name].as_string_fn, engine_fn,
+                             "%s's CLI tool does not call %s" % (cli_name, fn_name))
+                mcp_source = inspect.getsource(clangq_mcp.TOOLS[mcp_name].handler)
+                self.assertIn(fn_name, mcp_source,
+                             "%s's MCP handler does not appear to call %s" % (mcp_name, fn_name))
 
 
 if __name__ == "__main__":

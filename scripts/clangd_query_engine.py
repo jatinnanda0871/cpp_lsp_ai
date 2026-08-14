@@ -354,8 +354,15 @@ def run_query(client, mode, name, wait, include_decl=False, verbose=False, out=N
         label = it["label"]
         print("# %s  (def %s:%d-%d)"
               % (label, display_path(path, base), line + 1, it["end"] + 1), file=out)
-        print("# %s  (decl %s:%d)"
-              % (label, display_path(it["decl_path"], base), it["decl_line"] + 1), file=out)
+        if it["decl_path"]:
+            print("# %s  (decl %s:%d)"
+                  % (label, display_path(it["decl_path"], base), it["decl_line"] + 1), file=out)
+        else:
+            # textDocument/declaration found nothing separate from the
+            # definition (common when there is no header declaration) --
+            # "(decl :1)" would otherwise read as a real location at line 1
+            # of an unnamed file.
+            print("# %s  (decl: not found)" % label, file=out)
         print_refs_and_callers(it, label, mode, base, out)
         print("", file=out)
 
@@ -584,7 +591,7 @@ def _expansion_sites(refs, decl_path, decl_line):
 
 
 # ========================= struct queries =========================
-def run_struct_query(client, name, wait, include_decl=False, verbose=False, out=None):
+def run_struct_query(client, name, wait, verbose=False, out=None):
     """Declaration site of a struct (or typedef struct)."""
     base = client_root(client)
     out = out or sys.stdout
@@ -876,7 +883,7 @@ def run_outline_query(client, path, limit=DEFAULT_OUTLINE_LIMIT, wait=10,
     limit = max(1, min(limit, MAX_OUTLINE_LIMIT))
 
     try:
-        symbols = client.document_symbol(path)
+        symbols = client.document_symbol(path, timeout=wait)
     except Exception as e:
         print("# outline of %s failed (%s)" % (display_path(path, base), e), file=out)
         return
@@ -1046,7 +1053,7 @@ def run_hover_query(client, path, line, col, wait=10, verbose=False, out=None):
     path = resolve_input_path(client, path)
 
     try:
-        hover = client.hover(path, line, col)
+        hover = client.hover(path, line, col, timeout=wait)
     except Exception as e:
         print("  hover query failed (%s)" % e, file=out)
         return
@@ -1087,8 +1094,8 @@ def run_macro_query_as_string(client, mode, name, wait, include_decl=False, verb
     return _as_string(run_macro_query, client, mode, name, wait, include_decl, verbose)
 
 
-def run_struct_query_as_string(client, name, wait, include_decl=False, verbose=False):
-    return _as_string(run_struct_query, client, name, wait, include_decl, verbose)
+def run_struct_query_as_string(client, name, wait, verbose=False):
+    return _as_string(run_struct_query, client, name, wait, verbose)
 
 
 def run_hover_query_as_string(client, path, line, col, wait=10, verbose=False):
@@ -1197,6 +1204,96 @@ def client_from_args(args):
                         log=args.verbose)
 
 
+# =========== CLI tools (the non-refs/callers/all subcommands) ===========
+# struct/search/outline/diagnostics/hover/incoming each map onto exactly one
+# *_as_string engine function -- the same one clangq_mcp.py wraps as an MCP
+# tool. One table drives the subparser, the in-process call, and the daemon
+# call, so the CLI and the MCP server can't drift apart on which queries
+# exist (see QUERY_KINDS above for the same idea applied to refs/callers/all).
+class CliTool:
+    def __init__(self, name, help, configure, args_to_kwargs, as_string_fn):
+        self.name = name
+        self.help = help
+        self.configure = configure            # (subparser) -> None
+        self.args_to_kwargs = args_to_kwargs  # (Namespace) -> dict for as_string_fn
+        self.as_string_fn = as_string_fn      # (client, **kwargs) -> str
+
+
+def _configure_struct(p):
+    p.add_argument("name", help="struct name")
+
+
+def _configure_search(p):
+    p.add_argument("query", help="name or fragment to search for")
+    p.add_argument("--kind", default=None, choices=sorted(SEARCH_KIND_FILTERS),
+                   help="restrict results to one kind of symbol")
+    p.add_argument("--limit", type=int, default=DEFAULT_SEARCH_LIMIT,
+                   help="max rows to return (default %d, cap %d)"
+                        % (DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT))
+
+
+def _configure_outline(p):
+    p.add_argument("path", help="file path, repo-relative or absolute")
+    p.add_argument("--limit", type=int, default=DEFAULT_OUTLINE_LIMIT,
+                   help="max rows to return (default %d, cap %d)"
+                        % (DEFAULT_OUTLINE_LIMIT, MAX_OUTLINE_LIMIT))
+
+
+def _configure_diagnostics(p):
+    p.add_argument("path", help="file path, repo-relative or absolute")
+    p.add_argument("--severity", default=DEFAULT_SEVERITY,
+                   choices=sorted(SEVERITY_FILTERS),
+                   help="lowest severity to report (default: %s)" % DEFAULT_SEVERITY)
+
+
+def _configure_hover(p):
+    p.add_argument("path", help="file path, repo-relative or absolute")
+    p.add_argument("line", type=int, help="0-based line number")
+    p.add_argument("col", type=int, help="0-based column number")
+
+
+def _configure_incoming(p):
+    p.add_argument("name", help="function name")
+
+
+CLI_TOOLS = {
+    "struct": CliTool(
+        "struct", "declaration of a struct (or typedef struct)",
+        _configure_struct,
+        lambda a: {"name": a.name, "wait": a.wait, "verbose": a.verbose},
+        run_struct_query_as_string),
+    "search": CliTool(
+        "search", "fuzzy symbol search by name or fragment",
+        _configure_search,
+        lambda a: {"query": a.query, "kind": a.kind, "limit": a.limit,
+                   "wait": a.wait, "verbose": a.verbose},
+        run_search_query_as_string),
+    "outline": CliTool(
+        "outline", "every symbol declared in one file, nested, with line spans",
+        _configure_outline,
+        lambda a: {"path": a.path, "limit": a.limit, "wait": a.wait,
+                   "verbose": a.verbose},
+        run_outline_query_as_string),
+    "diagnostics": CliTool(
+        "diagnostics", "clangd's compiler diagnostics (errors/warnings) for one file",
+        _configure_diagnostics,
+        lambda a: {"path": a.path, "severity": a.severity, "wait": a.wait,
+                   "verbose": a.verbose},
+        run_diagnostics_query_as_string),
+    "hover": CliTool(
+        "hover", "type/signature/doc for the symbol at a file position",
+        _configure_hover,
+        lambda a: {"path": a.path, "line": a.line, "col": a.col,
+                   "wait": a.wait, "verbose": a.verbose},
+        run_hover_query_as_string),
+    "incoming": CliTool(
+        "incoming", "every function/method that calls a function (callers only, no def/decl)",
+        _configure_incoming,
+        lambda a: {"name": a.name, "wait": a.wait, "verbose": a.verbose},
+        run_incoming_calls_query_as_string),
+}
+
+
 # ===================== daemon server =====================
 # Request handlers, one per command. Each takes (client, req, args) and
 # returns (response_dict, keep_serving).
@@ -1234,6 +1331,22 @@ def _cmd_query(client, req, args):
     except Exception as e:
         return {"error": repr(e)}, True
     return {"out": buf.getvalue()}, True
+
+
+@_daemon_command("tool")
+def _cmd_tool(client, req, args):
+    """Dispatch one of CLI_TOOLS (struct/search/outline/diagnostics/hover/
+    incoming) -- the counterpart to _cmd_query for everything that isn't a
+    function/class/macro refs-callers-all query."""
+    tool = CLI_TOOLS.get(req.get("tool"))
+    if tool is None:
+        return {"error": "unknown tool %r" % req.get("tool")}, True
+
+    try:
+        out = tool.as_string_fn(client, **(req.get("kwargs") or {}))
+    except Exception as e:
+        return {"error": repr(e)}, True
+    return {"out": out}, True
 
 
 def serve(args):
@@ -1349,10 +1462,38 @@ def daemon_query(args):
         _send_json(conn, {
             "cmd": "query",
             "kind": symbol_kind(args),
-            "mode": args.mode,
+            "mode": args.command,
             "name": args.name,
             "wait": args.wait,
             "include_decl": args.include_decl,
+        })
+        resp = json.loads(_recv_line(conn))
+    finally:
+        conn.close()
+
+    if "error" in resp:
+        print("  daemon error:", resp["error"])
+    else:
+        sys.stdout.write(resp.get("out", ""))
+
+
+def daemon_tool(args, tool):
+    """Send one CLI_TOOLS request to the daemon -- the counterpart to
+    daemon_query for struct/search/outline/diagnostics/hover/incoming."""
+    sock_path, log_path = _paths(args.root)
+    conn = _try_connect(sock_path)
+    if conn is None and not args.no_daemon:
+        _start_daemon(args, log_path)
+        conn = _wait_connect(sock_path, 30)
+    if conn is None:
+        sys.exit("could not connect to a daemon for %s (log: %s)"
+                 % (os.path.abspath(args.root), log_path))
+
+    try:
+        _send_json(conn, {
+            "cmd": "tool",
+            "tool": tool.name,
+            "kwargs": tool.args_to_kwargs(args),
         })
         resp = json.loads(_recv_line(conn))
     finally:
@@ -1380,14 +1521,103 @@ def stop(args):
 
 # ===================== interactive shell (single process) ===========
 HELP = ("commands:\n"
-        "  refs <symbol> [decl]     cross-file references ('decl' includes the declaration)\n"
-        "  callers <symbol>         incoming calls\n"
-        "  all <symbol>             refs + callers\n"
-        "  help                     this message\n"
-        "  quit | exit              shut down clangd and leave")
+        "  refs <symbol> [decl]        cross-file references ('decl' includes the declaration)\n"
+        "  callers <symbol>            incoming calls\n"
+        "  all <symbol>                refs + callers\n"
+        "  struct <symbol>             struct (or typedef struct) declaration\n"
+        "  incoming <symbol>           incoming callers only, no def/decl header\n"
+        "  search <query> [kind]       fuzzy symbol search, optionally restricted to one kind\n"
+        "  outline <path> [limit]      every symbol declared in one file\n"
+        "  diagnostics <path> [sev]    compiler diagnostics for one file (sev: error/warning/all)\n"
+        "  hover <path> <line> <col>   type/signature/doc at a position (0-based)\n"
+        "  help                        this message\n"
+        "  quit | exit                 shut down clangd and leave")
 
 REPL_QUIT = ("quit", "exit", "q")
 REPL_HELP = ("help", "h", "?")
+
+
+def _repl_symbol_query(client, cmd, parts, wait, verbose):
+    """refs / callers / all -- the original REPL commands, function-only."""
+    if len(parts) < 2:
+        print("  usage: %s <symbol>" % cmd)
+        return
+    include_decl = (cmd == "refs" and len(parts) > 2 and
+                    parts[2].lower() in ("decl", "--include-decl"))
+    run_query(client, cmd, parts[1], wait, include_decl, verbose)
+
+
+def _repl_struct(client, parts, wait, verbose):
+    if len(parts) < 2:
+        print("  usage: struct <symbol>")
+        return
+    sys.stdout.write(run_struct_query_as_string(client, parts[1], wait, verbose=verbose))
+
+
+def _repl_incoming(client, parts, wait, verbose):
+    if len(parts) < 2:
+        print("  usage: incoming <symbol>")
+        return
+    sys.stdout.write(run_incoming_calls_query_as_string(client, parts[1], wait, verbose=verbose))
+
+
+def _repl_search(client, parts, wait, verbose):
+    if len(parts) < 2:
+        print("  usage: search <query> [kind]")
+        return
+    kind = parts[2] if len(parts) > 2 else None
+    sys.stdout.write(run_search_query_as_string(
+        client, parts[1], kind=kind, wait=wait, verbose=verbose))
+
+
+def _repl_outline(client, parts, wait, verbose):
+    if len(parts) < 2:
+        print("  usage: outline <path> [limit]")
+        return
+    limit = DEFAULT_OUTLINE_LIMIT
+    if len(parts) > 2:
+        try:
+            limit = int(parts[2])
+        except ValueError:
+            print("  limit must be an integer")
+            return
+    sys.stdout.write(run_outline_query_as_string(
+        client, parts[1], limit=limit, wait=wait, verbose=verbose))
+
+
+def _repl_diagnostics(client, parts, wait, verbose):
+    if len(parts) < 2:
+        print("  usage: diagnostics <path> [severity]")
+        return
+    severity = parts[2] if len(parts) > 2 else DEFAULT_SEVERITY
+    sys.stdout.write(run_diagnostics_query_as_string(
+        client, parts[1], severity=severity, wait=wait, verbose=verbose))
+
+
+def _repl_hover(client, parts, wait, verbose):
+    if len(parts) < 4:
+        print("  usage: hover <path> <line> <col>")
+        return
+    try:
+        line, col = int(parts[2]), int(parts[3])
+    except ValueError:
+        print("  line and col must be integers")
+        return
+    sys.stdout.write(run_hover_query_as_string(
+        client, parts[1], line, col, wait=wait, verbose=verbose))
+
+
+# name -> (client, parts, wait, verbose) -> None, matching everything except
+# refs/callers/all (handled directly by _repl_symbol_query, since it alone
+# takes a `cmd` -- the query mode -- rather than being one fixed query).
+REPL_TOOL_COMMANDS = {
+    "struct": _repl_struct,
+    "incoming": _repl_incoming,
+    "search": _repl_search,
+    "outline": _repl_outline,
+    "diagnostics": _repl_diagnostics,
+    "hover": _repl_hover,
+}
 
 
 def repl(client, wait, verbose):
@@ -1412,17 +1642,14 @@ def repl(client, wait, verbose):
         if cmd in REPL_HELP:
             print(HELP)
             continue
-        if cmd not in ("refs", "callers", "all"):
-            print("  unknown command: %s (try 'help')" % cmd)
-            continue
-        if len(parts) < 2:
-            print("  usage: %s <symbol>" % cmd)
-            continue
 
-        include_decl = (cmd == "refs" and len(parts) > 2 and
-                        parts[2].lower() in ("decl", "--include-decl"))
         try:
-            run_query(client, cmd, parts[1], wait, include_decl, verbose)
+            if cmd in ("refs", "callers", "all"):
+                _repl_symbol_query(client, cmd, parts, wait, verbose)
+            elif cmd in REPL_TOOL_COMMANDS:
+                REPL_TOOL_COMMANDS[cmd](client, parts, wait, verbose)
+            else:
+                print("  unknown command: %s (try 'help')" % cmd)
         except Exception as e:
             print("  error: %s" % e)
 
@@ -1446,7 +1673,17 @@ def _run_query_in_process(args):
     try:
         client.prime_index()
         QUERY_KINDS[symbol_kind(args)](
-            client, args.mode, args.name, args.wait, args.include_decl, args.verbose)
+            client, args.command, args.name, args.wait, args.include_decl, args.verbose)
+    finally:
+        client.shutdown()
+
+
+def _run_tool_in_process(args, tool):
+    """In-process (--no-daemon) counterpart to daemon_tool."""
+    client = client_from_args(args).start()
+    try:
+        client.prime_index()
+        sys.stdout.write(tool.as_string_fn(client, **tool.args_to_kwargs(args)))
     finally:
         client.shutdown()
 
@@ -1462,43 +1699,78 @@ SESSION_HANDLERS = {
 def build_parser():
     ap = argparse.ArgumentParser(
         description="Semantic codebase queries via clangd (standalone, daemon-backed)")
-    ap.add_argument("mode", choices=list(QUERY_MODES) + list(SESSION_MODES))
-    ap.add_argument("name", nargs="?", help="symbol name (omit for shell/daemon/stop)")
-    ap.add_argument("--class", action="store_true", dest="is_class",
-                    help="treat name as a class instead of a function")
-    ap.add_argument("--macro", action="store_true", dest="is_macro",
-                    help="treat name as a macro instead of a function")
-    ap.add_argument("--root", default=".", help="repo root (default: cwd)")
-    ap.add_argument("--ccdir", default=None,
-                    help="dir with compile_commands.json (default: <root> then <root>/build)")
-    ap.add_argument("--wait", type=int, default=10,
-                    help="seconds to wait for the background index")
-    ap.add_argument("--req-timeout", type=int, default=10,
-                    help="per-request timeout (raise for heavy TUs)")
-    ap.add_argument("--clangd", default="clangd",
-                    help="clangd binary name/path (e.g. clangd-14)")
-    ap.add_argument("--include-decl", action="store_true",
-                    help="refs mode: include the declaration")
-    ap.add_argument("--no-daemon", action="store_true",
-                    help="run the query in-process instead of via the daemon")
-    ap.add_argument("-v", "--verbose", action="store_true")
+
+    # Shared by every subcommand. A parent parser (not top-level arguments)
+    # because argparse subparsers each need their own copy of --root etc. --
+    # top-level optionals aren't visible to a subparser's own argv slice.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--root", default=".", help="repo root (default: cwd)")
+    common.add_argument("--ccdir", default=None,
+                        help="dir with compile_commands.json (default: <root> then <root>/build)")
+    common.add_argument("--wait", type=int, default=10,
+                        help="seconds to wait for the background index / a single request")
+    common.add_argument("--req-timeout", type=int, default=10,
+                        help="per-request timeout (raise for heavy TUs)")
+    common.add_argument("--clangd", default="clangd",
+                        help="clangd binary name/path (e.g. clangd-14)")
+    common.add_argument("--no-daemon", action="store_true",
+                        help="run the query in-process instead of via the daemon")
+    common.add_argument("-v", "--verbose", action="store_true")
+
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    # refs / callers / all -- a function, class, or macro (mutually exclusive).
+    for mode in QUERY_MODES:
+        p = sub.add_parser(mode, parents=[common],
+                           help="%s of a function, class (--class), or macro (--macro)" % mode)
+        p.add_argument("name", help="symbol name, plain or qualified (Class::method)")
+        kind = p.add_mutually_exclusive_group()
+        kind.add_argument("--class", action="store_true", dest="is_class",
+                          help="treat name as a class instead of a function")
+        kind.add_argument("--macro", action="store_true", dest="is_macro",
+                          help="treat name as a macro instead of a function")
+        p.add_argument("--include-decl", action="store_true",
+                       help="refs mode: include the declaration")
+
+    # struct/search/outline/diagnostics/hover/incoming -- everything else
+    # clangq_mcp.py exposes as an MCP tool. See CLI_TOOLS.
+    for name, tool in CLI_TOOLS.items():
+        p = sub.add_parser(name, parents=[common], help=tool.help)
+        tool.configure(p)
+
+    for mode in SESSION_MODES:
+        sub.add_parser(mode, parents=[common], help="%s session" % mode)
+
     return ap
 
 
 def main():
+    # clangd's hover/detail text is UTF-8 and can contain characters (e.g.
+    # an arrow in a lambda signature) outside a Windows console's cp1252
+    # default -- without this, printing them crashes with
+    # UnicodeEncodeError instead of showing the query result.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     ap = build_parser()
     args = ap.parse_args()
 
-    session = SESSION_HANDLERS.get(args.mode)
+    session = SESSION_HANDLERS.get(args.command)
     if session is not None:
         session(args)
         return
 
-    if not args.name:
-        ap.error("a symbol name is required for %r" % args.mode)
-    if args.is_class and args.is_macro:
-        ap.error("--class and --macro are mutually exclusive")
+    tool = CLI_TOOLS.get(args.command)
+    if tool is not None:
+        if args.no_daemon:
+            _run_tool_in_process(args, tool)
+        else:
+            daemon_tool(args, tool)
+        return
 
+    # Otherwise it's refs/callers/all -- argparse already enforced --class
+    # and --macro as mutually exclusive and `name` as required.
     if args.no_daemon:
         _run_query_in_process(args)
     else:

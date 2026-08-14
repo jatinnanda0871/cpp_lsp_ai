@@ -41,7 +41,8 @@ ripgrep-based heuristics:
 ## How it works
 
 ```
-clangd_query_engine.py  (CLI: refs / callers / all / class / macro / struct / hover / shell)
+clangd_query_engine.py  (CLI: refs / callers / all / struct / search / outline /
+                          diagnostics / hover / incoming; shell / daemon / stop)
         │
         ▼
   daemon (background process, one per repo root)
@@ -77,6 +78,10 @@ repeated startup/indexing cost. Use `stop` to shut the daemon down, or
 
 ## CLI usage
 
+Every query the MCP server exposes as a tool (see below) also has a CLI
+subcommand, so the CLI and the assistant-facing server are two front ends on
+the same engine, not two different feature sets.
+
 ```bash
 # One-shot queries (auto-starts a daemon for the repo, reuses it after)
 ./clangd_query_engine.py all     processRequest --root /path/to/repo
@@ -89,7 +94,26 @@ repeated startup/indexing cost. Use `stop` to shut the daemon down, or
 # Macro queries: declaration + every expansion site
 ./clangd_query_engine.py all LOG_DEBUG --macro --root /path/to/repo
 
-# Interactive REPL (clangd stays warm across queries in one process)
+# Struct declaration (including typedef struct)
+./clangd_query_engine.py struct Point --root /path/to/repo
+
+# Fuzzy symbol search -- the way in when the exact name isn't known yet
+./clangd_query_engine.py search Backend --kind class --root /path/to/repo
+
+# Every symbol in one file, nested, with line spans and signatures
+./clangd_query_engine.py outline src/parser.cpp --root /path/to/repo
+
+# Compiler diagnostics for one file, reflecting what's on disk right now
+./clangd_query_engine.py diagnostics src/parser.cpp --severity error --root /path/to/repo
+
+# Type/signature/doc for the symbol at a position (0-based line/col)
+./clangd_query_engine.py hover src/parser.cpp 42 8 --root /path/to/repo
+
+# Callers only, without the def/decl header lines that `callers` prints
+./clangd_query_engine.py incoming doThing --root /path/to/repo
+
+# Interactive REPL (clangd stays warm across queries in one process; all of
+# the above are available as REPL commands too -- type 'help')
 ./clangd_query_engine.py shell --root /path/to/repo
 
 # Daemon management
@@ -97,18 +121,33 @@ repeated startup/indexing cost. Use `stop` to shut the daemon down, or
 ./clangd_query_engine.py stop   --root /path/to/repo      # shut the daemon down
 ```
 
-Useful flags:
+Useful flags (present on every subcommand):
 
 | Flag | Purpose |
 |---|---|
 | `--root` | Repo root (default: cwd) |
 | `--ccdir` | Directory containing `compile_commands.json`, if not `<root>`/`<root>/build` |
+| `--no-daemon` | Run the query in-process instead of via the daemon |
+| `--wait` | Seconds to wait for clangd's background index / a single request |
+| `--req-timeout` | Per-request timeout to clangd (raise for heavy translation units) |
+| `--clangd` | clangd binary name/path (e.g. `clangd-14`) |
+| `-v` / `--verbose` | Print progress/debug info to stderr |
+
+Flags specific to `refs` / `callers` / `all`:
+
+| Flag | Purpose |
+|---|---|
 | `--class` | Treat `name` as a class; queries all of its methods |
 | `--macro` | Treat `name` as a macro |
 | `--include-decl` | Include the declaration itself in `refs` results |
-| `--no-daemon` | Run the query in-process instead of via the daemon |
-| `--wait` | Seconds to wait for clangd's background index to warm up |
-| `-v` / `--verbose` | Print progress/debug info to stderr |
+
+Flags specific to `search` / `outline` / `diagnostics`:
+
+| Flag | Purpose |
+|---|---|
+| `--kind` | (`search`) Restrict to one symbol kind: function, class, struct, macro, ... |
+| `--limit` | (`search`, `outline`) Max rows to return |
+| `--severity` | (`diagnostics`) Lowest severity to report: `error`, `warning`, `all` |
 
 ## Using it as an MCP server (AI assistant integration)
 
