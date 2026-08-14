@@ -135,6 +135,8 @@ search over the codebase.
            "get_class_info",
            "get_macro_info",
            "get_struct_info",
+           "get_file_outline",
+           "get_diagnostics",
            "get_hover_info",
            "get_incoming_calls"
          ]
@@ -158,6 +160,8 @@ instance can serve queries across multiple repos — it keeps one warm
 | `get_class_info` | Declaration location plus definition/refs/callers for every method on a class |
 | `get_macro_info` | Macro declaration location and all usages/expansion sites |
 | `get_struct_info` | Struct declaration/definition location |
+| `get_file_outline` | Every symbol declared in one file — nested, with line spans and signatures |
+| `get_diagnostics` | clangd's compiler errors/warnings for one file, reflecting what is on disk now |
 | `get_hover_info` | Type/signature/doc info for a symbol at a specific file position (like IDE hover) |
 | `get_incoming_calls` | All functions/methods that call a given function |
 
@@ -200,6 +204,51 @@ A filter that matches nothing says so distinctly from a name that matches
 nothing (`6 symbols match 'Backend', but none of kind 'macro' (found: class,
 constructor, field, method)`), so a too-narrow filter is never mistaken for an
 absent symbol.
+
+#### `get_file_outline` — reading a file without reading it
+
+Takes a `path` (repo-relative or absolute) and an optional `limit` (default
+300). clangd puts each symbol's signature in `detail`, so the outline carries
+types without a second query, and the spans give exact ranges to read next:
+
+```
+# Outline of include/chains.h (19 symbols)
+  namespace   chain                    17-54
+    class       Backend                  19-35
+      method      process                  24-24   int (const corpus::Str &)
+      method      processedCount           30-30   int () const
+      field       m_count                  34-34   int
+```
+
+#### `get_diagnostics` — checking an edit without building
+
+Takes a `path` and an optional `severity` (`error`, `warning` = errors and
+warnings, or `all`, the default). This is the edit loop: change a file, ask
+what broke, fix it — no build system involved.
+
+```
+# Diagnostics for src/chains.cpp: 1 error
+  error    src/chains.cpp:71:27  Use of undeclared identifier 'foo' [clang:undeclared_var_use]
+```
+
+Two distinctions it is careful about:
+
+- **"Not reported yet" is never rendered as "clean."** clangd pushes
+  diagnostics unprompted when it finishes parsing, so nothing arriving within
+  the timeout means only that — it says so explicitly rather than issuing a
+  false all-clear on a file that may not compile.
+- **A file outside `compile_commands.json`** is parsed with guessed flags and
+  can report spurious errors. The tool description says so, and a repo with no
+  compilation database at all already gets a warning on every call.
+
+### Files are re-read when they change
+
+`did_open` now stats a file on each use and pushes a `didChange` when it has
+changed on disk. Without this a long-lived client answers from the contents at
+first open — silently, and for the life of the process — which would make
+`get_diagnostics` useless (it would report a freshly broken file as clean) and
+`get_hover_info` quietly wrong after any edit. Unchanged files cost one `stat`,
+not a re-read.
 
 ## Notes
 

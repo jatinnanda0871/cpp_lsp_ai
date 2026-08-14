@@ -125,6 +125,42 @@ class TestArgumentHandling(unittest.TestCase):
                 "search_symbols", {"root": self.root, "query": "x", "limit": bad})
             self.assertIn("must be an integer", out, "limit=%r: %s" % (bad, out))
 
+    def test_outline_and_diagnostics_require_a_path(self):
+        for tool in ("get_file_outline", "get_diagnostics"):
+            out = clangq_mcp._run_tool(tool, {"root": self.root})
+            self.assertIn("path is required", out, "%s: %s" % (tool, out))
+
+    def test_diagnostics_rejects_unknown_severity(self):
+        out = clangq_mcp._run_tool(
+            "get_diagnostics",
+            {"root": self.root, "path": "a.cpp", "severity": "critical"})
+        self.assertIn("severity must be one of", out)
+
+    def test_outline_rejects_out_of_range_limit(self):
+        for bad, expected in ((0, "at least 1"),
+                              (clangq_mcp.MAX_OUTLINE_LIMIT + 1, "must not exceed")):
+            out = clangq_mcp._run_tool(
+                "get_file_outline",
+                {"root": self.root, "path": "a.cpp", "limit": bad})
+            self.assertIn(expected, out, "limit=%r: %s" % (bad, out))
+
+    def test_outline_rejects_non_integer_limit(self):
+        for bad in ("300", True):
+            out = clangq_mcp._run_tool(
+                "get_file_outline",
+                {"root": self.root, "path": "a.cpp", "limit": bad})
+            self.assertIn("must be an integer", out, "limit=%r: %s" % (bad, out))
+
+    def test_new_tools_are_advertised_with_their_schemas(self):
+        outline = clangq_mcp.TOOLS["get_file_outline"].as_mcp_tool()
+        self.assertEqual(outline.inputSchema["required"], ["root", "path"])
+
+        diagnostics = clangq_mcp.TOOLS["get_diagnostics"].as_mcp_tool()
+        self.assertEqual(diagnostics.inputSchema["required"], ["root", "path"])
+        self.assertEqual(
+            sorted(diagnostics.inputSchema["properties"]["severity"]["enum"]),
+            sorted(clangq_mcp.SEVERITY_FILTERS))
+
     def test_search_is_advertised_with_its_schema(self):
         """The tool must reach the host's tool list, and its enum must match
         the filters the engine actually accepts."""

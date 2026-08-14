@@ -811,6 +811,194 @@ def run_search_query(client, query, kind=None, limit=DEFAULT_SEARCH_LIMIT,
               "is not exhaustive" % len(symbols), file=out)
 
 
+# ========================= file outline =========================
+# An outline is meant to be the whole file, so this is a safety valve for a
+# generated or amalgamated source, not a normal working limit.
+DEFAULT_OUTLINE_LIMIT = 300
+MAX_OUTLINE_LIMIT = 2000
+
+
+def _symbol_span(sym):
+    """(start, end) 0-based lines for either DocumentSymbol shape.
+
+    Hierarchical replies carry `range` directly; flat SymbolInformation
+    nests it under `location`. clangd sends the first, but the reply shape
+    is negotiated at startup, so handling only that would break on a server
+    that declines the hierarchical capability.
+    """
+    span = sym.get("range") or (sym.get("location") or {}).get("range") or {}
+    start = ((span.get("start") or {}).get("line")) or 0
+    end = ((span.get("end") or {}).get("line"))
+    return start, (start if end is None else end)
+
+
+def _outline_rows(nodes, base, depth=0, rows=None):
+    """Flatten a DocumentSymbol tree into printable rows, depth first."""
+    if rows is None:
+        rows = []
+    for sym in nodes or []:
+        if not isinstance(sym, dict):
+            continue
+        start, end = _symbol_span(sym)
+        label = kind_label(sym.get("kind"))
+        # clangd sets detail="class" on a class, which just repeats the kind
+        # column; a signature is worth a column, a synonym is not.
+        detail = (sym.get("detail") or "").strip()
+        if detail == label:
+            detail = ""
+        rows.append("%s%-11s %-34s %d-%d%s" % (
+            "  " + "  " * depth,
+            label,
+            sym.get("name") or "(unnamed)",
+            start + 1, end + 1,
+            "   %s" % detail if detail else ""))
+        _outline_rows(sym.get("children") or [], base, depth + 1, rows)
+    return rows
+
+
+def run_outline_query(client, path, limit=DEFAULT_OUTLINE_LIMIT, wait=10,
+                      verbose=False, out=None):
+    """Every symbol declared in one file, nested, with line spans.
+
+    Lets a caller orient in a large file for a few dozen lines of output
+    instead of reading the whole thing, and the spans give exact ranges to
+    read afterwards. clangd puts the signature in `detail`, so the rows
+    carry types without a second query.
+    """
+    base = client_root(client)
+    out = out or sys.stdout
+    path = resolve_input_path(client, path)
+
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = DEFAULT_OUTLINE_LIMIT
+    limit = max(1, min(limit, MAX_OUTLINE_LIMIT))
+
+    try:
+        symbols = client.document_symbol(path)
+    except Exception as e:
+        print("# outline of %s failed (%s)" % (display_path(path, base), e), file=out)
+        return
+
+    where = display_path(path, base)
+    if not symbols:
+        # Distinguishable from a parse failure above: clangd answered, the
+        # file simply declares nothing at file scope.
+        print("# %s declares no symbols (clangd returned an empty outline -- "
+              "the file may be header-guard-only, or excluded from "
+              "compile_commands.json)" % where, file=out)
+        return
+
+    rows = _outline_rows(symbols, base)
+    print("# Outline of %s (%d symbol%s)"
+          % (where, len(rows), "" if len(rows) == 1 else "s"), file=out)
+    for row in rows[:limit]:
+        print(row, file=out)
+    if len(rows) > limit:
+        print("# %d more not shown (limit=%d)" % (len(rows) - limit, limit), file=out)
+
+
+# ========================= diagnostics =========================
+# LSP DiagnosticSeverity.
+DIAGNOSTIC_SEVERITIES = {1: "error", 2: "warning", 3: "info", 4: "hint"}
+
+# What a caller may ask for. 'error' alone is the common case for an edit
+# loop; the rest are noise until the file compiles.
+SEVERITY_FILTERS = {
+    "error": (1,),
+    "warning": (1, 2),
+    "all": (1, 2, 3, 4),
+}
+DEFAULT_SEVERITY = "all"
+
+
+def _diagnostic_row(diag, base, path):
+    span = diag.get("range") or {}
+    start = span.get("start") or {}
+    line = (start.get("line") or 0) + 1
+    col = (start.get("character") or 0) + 1
+    severity = DIAGNOSTIC_SEVERITIES.get(diag.get("severity"), "diagnostic")
+    message = " ".join((diag.get("message") or "").split())
+    code = diag.get("code")
+    bits = [str(b) for b in (diag.get("source"), code) if b not in (None, "")]
+    tag = " [%s]" % ":".join(bits) if bits else ""
+    return "  %-8s %s:%d:%d  %s%s" % (
+        severity, display_path(path, base), line, col, message, tag)
+
+
+def run_diagnostics_query(client, path, severity=DEFAULT_SEVERITY, wait=15,
+                          verbose=False, out=None):
+    """Compiler diagnostics for one file, straight from clangd's parse.
+
+    The point is an edit loop that does not need the build system: change a
+    file, ask what broke, fix it. clangd reparses on didChange, so the answer
+    reflects what is on disk now rather than at first open.
+    """
+    base = client_root(client)
+    out = out or sys.stdout
+    path = resolve_input_path(client, path)
+
+    keep = SEVERITY_FILTERS.get(severity)
+    if keep is None:
+        print("# diagnostics: unknown severity %r (valid: %s)"
+              % (severity, ", ".join(sorted(SEVERITY_FILTERS))), file=out)
+        return
+
+    try:
+        diags, received = client.diagnostics(path, timeout=wait)
+    except Exception as e:
+        print("# diagnostics for %s failed (%s)"
+              % (display_path(path, base), e), file=out)
+        return
+
+    where = display_path(path, base)
+    if not received:
+        # NOT "no problems": clangd never answered, so this says nothing
+        # about whether the file is clean, and a caller acting on a false
+        # all-clear is the specific failure this branch exists to prevent.
+        print("# no diagnostics reported for %s within %ss -- clangd may still "
+              "be parsing it, or the file is not in compile_commands.json. "
+              "This is NOT a clean bill of health; retry or widen the wait."
+              % (where, wait), file=out)
+        return
+
+    kept = [d for d in diags if isinstance(d, dict) and d.get("severity") in keep]
+    if not diags:
+        print("# %s: no diagnostics -- clangd parsed it cleanly" % where, file=out)
+        return
+    if not kept:
+        counts = _severity_counts(diags)
+        print("# %s: no diagnostics at severity %r (file has %s)"
+              % (where, severity, counts), file=out)
+        return
+
+    kept.sort(key=lambda d: (((d.get("range") or {}).get("start") or {}).get("line") or 0,
+                             ((d.get("range") or {}).get("start") or {}).get("character") or 0))
+    print("# Diagnostics for %s: %s" % (where, _severity_counts(kept)), file=out)
+    for diag in kept:
+        print(_diagnostic_row(diag, base, path), file=out)
+
+
+def _severity_counts(diags):
+    """'2 errors, 1 warning' -- a summary line the caller can act on without
+    reading every row."""
+    counts = {}
+    for diag in diags:
+        if isinstance(diag, dict):
+            name = DIAGNOSTIC_SEVERITIES.get(diag.get("severity"), "diagnostic")
+            counts[name] = counts.get(name, 0) + 1
+    if not counts:
+        return "none"
+    order = ["error", "warning", "info", "hint", "diagnostic"]
+    parts = []
+    for name in order:
+        n = counts.get(name)
+        if n:
+            parts.append("%d %s%s" % (n, name, "" if n == 1 else "s"))
+    return ", ".join(parts)
+
+
 # ========================= hover queries =========================
 def _hover_text(contents):
     """Flatten hover's payload -- MarkupContent, a MarkedString, or an
@@ -915,6 +1103,16 @@ def run_search_query_as_string(client, query, kind=None,
                                limit=DEFAULT_SEARCH_LIMIT, wait=10,
                                verbose=False):
     return _as_string(run_search_query, client, query, kind, limit, wait, verbose)
+
+
+def run_outline_query_as_string(client, path, limit=DEFAULT_OUTLINE_LIMIT,
+                                wait=10, verbose=False):
+    return _as_string(run_outline_query, client, path, limit, wait, verbose)
+
+
+def run_diagnostics_query_as_string(client, path, severity=DEFAULT_SEVERITY,
+                                    wait=15, verbose=False):
+    return _as_string(run_diagnostics_query, client, path, severity, wait, verbose)
 
 # ===================== daemon transport =====================
 def _user():
