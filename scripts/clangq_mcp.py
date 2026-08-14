@@ -24,6 +24,10 @@ from clangd_query_engine import (
     run_struct_query_as_string,
     run_hover_query_as_string,
     run_incoming_calls_query_as_string,
+    run_search_query_as_string,
+    SEARCH_KIND_FILTERS,
+    DEFAULT_SEARCH_LIMIT,
+    MAX_SEARCH_LIMIT,
 )
 
 # ============================ tunables ============================
@@ -192,6 +196,31 @@ def _validate_flag(label, value):
     return None
 
 
+def _validate_kind(label, value):
+    """Rejected rather than ignored: an unknown kind falling through to an
+    unfiltered search returns results that quietly disregard the constraint
+    the caller set, which reads as "these are all functions" when they aren't.
+    """
+    if not isinstance(value, str) or value not in SEARCH_KIND_FILTERS:
+        return "Error: %s must be one of %s, got %r" % (
+            label, ", ".join(sorted(SEARCH_KIND_FILTERS)), value)
+    return None
+
+
+def _validate_limit(label, value):
+    """bool subclasses int here too, and a cap keeps one call from flooding
+    the caller's context with a whole repo's symbol table."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "Error: %s must be an integer, got %s (%r)" % (
+            label, _type_name(value), value)
+    if value < 1:
+        return "Error: %s must be at least 1, got %d" % (label, value)
+    if value > MAX_SEARCH_LIMIT:
+        return "Error: %s must not exceed %d, got %d" % (
+            label, MAX_SEARCH_LIMIT, value)
+    return None
+
+
 ROOT = Param(
     "root",
     {"type": "string", "description": "Repo root path"},
@@ -228,6 +257,25 @@ INCLUDE_DECL = Param(
     {"type": "boolean", "default": False,
      "description": "Include the declaration in the references list"},
     required=False, default=False, validate=_validate_flag,
+)
+SEARCH_QUERY = Param(
+    "query",
+    {"type": "string",
+     "description": "Name or fragment to search for e.g. 'parse', 'Handler'"},
+    validate=_validate_symbol_name, hint="a non-empty search string",
+)
+SEARCH_KIND = Param(
+    "kind",
+    {"type": "string", "enum": sorted(SEARCH_KIND_FILTERS),
+     "description": "Restrict results to one kind of symbol"},
+    required=False, default=None, validate=_validate_kind,
+)
+SEARCH_LIMIT = Param(
+    "limit",
+    {"type": "integer", "default": DEFAULT_SEARCH_LIMIT,
+     "minimum": 1, "maximum": MAX_SEARCH_LIMIT,
+     "description": "Maximum rows to return (default %d)" % DEFAULT_SEARCH_LIMIT},
+    required=False, default=DEFAULT_SEARCH_LIMIT, validate=_validate_limit,
 )
 
 
@@ -271,6 +319,25 @@ def _tool(name, description, params):
         TOOLS[name] = ToolSpec(name, description, params, handler)
         return handler
     return register
+
+
+@_tool(
+    "search_symbols",
+    "Fuzzy-search the codebase for symbols by name or fragment, e.g. 'parse' "
+    "or 'Handler'. Use this FIRST whenever the exact symbol name is not "
+    "already known -- it returns qualified names ('Class::method') that every "
+    "other tool here accepts, so it is the way in to them. Results are split "
+    "into exact and fuzzy matches and can be narrowed with `kind` "
+    "(function, class, struct, macro, variable, namespace, ...).",
+    [ROOT, SEARCH_QUERY, SEARCH_KIND, SEARCH_LIMIT],
+)
+def _search_symbols(client, args):
+    # QUERY_WAIT_S, not a shorter budget: on a cold index a hasty "nothing
+    # found" is indistinguishable to the caller from "no such symbol", and
+    # resolve_symbol already fast-fails once the index is known warm.
+    return run_search_query_as_string(
+        client, args["query"], kind=args["kind"], limit=args["limit"],
+        wait=QUERY_WAIT_S)
 
 
 @_tool(

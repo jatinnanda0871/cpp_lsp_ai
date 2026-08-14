@@ -12,9 +12,14 @@ Skipped automatically when no clangd is installed.
 """
 import os
 import re
+import sys
 import unittest
 
-import support
+# So `python3 -m unittest tests.test_integration` works from the repo root,
+# where tests/ is not on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import support  # noqa: E402  (needs the path set up first)
 
 from clangd_client import ClangdClient
 from clangd_query_engine import (
@@ -24,6 +29,7 @@ from clangd_query_engine import (
     run_struct_query_as_string,
     run_hover_query_as_string,
     run_incoming_calls_query_as_string,
+    run_search_query_as_string,
 )
 
 CLANGD = support.find_clangd()
@@ -72,6 +78,95 @@ class IntegrationBase(unittest.TestCase):
     def decls_in(self, text):
         return [(m.group(1), int(m.group(2)))
                 for m in re.finditer(r"\(decl (.+?):(\d+)\)", text)]
+
+
+class TestSymbolSearch(IntegrationBase):
+    """Ground truth for the discovery entry point. The load-bearing assertion
+    is the round trip: a name this tool prints must be one the other tools
+    can actually resolve, or search sends every caller down a dead end."""
+
+    def rows_in(self, text):
+        """[(kind, qualified_name, location)] from the result rows."""
+        rows = []
+        for line in text.splitlines():
+            if line.startswith("#") or not line.startswith("  "):
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                rows.append((parts[0], parts[1], parts[2]))
+        return rows
+
+    def test_exact_name_is_found_and_labelled(self):
+        out = run_search_query_as_string(self.client, "Backend", wait=WAIT)
+        self.assertNoError(out, "search Backend")
+        self.assertIn("# exact", out)
+        rows = self.rows_in(out)
+        self.assertTrue(any(k == "class" and n == "chain::Backend" for k, n, _ in rows),
+                        "chain::Backend not found as a class:\n%s" % out)
+
+    def test_fragment_finds_related_symbols_fuzzily(self):
+        """The reason the tool exists: a caller who knows 'backend' but not
+        'Frontend::setBackend' still gets there."""
+        out = run_search_query_as_string(self.client, "Backend", wait=WAIT)
+        names = [n for _, n, _ in self.rows_in(out)]
+        self.assertIn("chain::Frontend::setBackend", names,
+                      "fuzzy neighbours missing:\n%s" % out)
+
+    def test_names_round_trip_into_the_other_tools(self):
+        """Every qualified name search prints must resolve when fed back to
+        get_function_info -- otherwise the handoff silently breaks."""
+        out = run_search_query_as_string(
+            self.client, "process", kind="function", wait=WAIT)
+        names = [n for _, n, _ in self.rows_in(out)]
+        self.assertIn("chain::Backend::process", names,
+                      "search did not surface the method:\n%s" % out)
+
+        back = run_query_as_string(self.client, "all", "chain::Backend::process", WAIT)
+        self.assertNoError(back, "round trip")
+        self.assertTrue(self.defs_in(back),
+                        "name from search did not resolve:\n%s" % back)
+
+    def test_kind_filter_narrows_to_types(self):
+        out = run_search_query_as_string(
+            self.client, "Backend", kind="class", wait=WAIT)
+        kinds = {k for k, _, _ in self.rows_in(out)}
+        self.assertTrue(kinds, "kind filter returned nothing:\n%s" % out)
+        self.assertNotIn("method", kinds, "class filter let methods through:\n%s" % out)
+
+    def test_struct_is_findable_despite_clangd_calling_it_a_class(self):
+        """clangd files structs under Class, so this filter has to be a
+        superset -- a spec-literal one reports zero structs in a repo of them."""
+        out = run_search_query_as_string(
+            self.client, "Point", kind="struct", wait=WAIT)
+        self.assertNoError(out, "search Point")
+        self.assertIn("Point", out)
+        self.assertNotIn("none of kind", out)
+
+    def test_macro_is_findable_though_the_index_hides_it(self):
+        """workspace/symbol never reports a #define until its file is open, so
+        without the fallback this reads as 'check the spelling'."""
+        out = run_search_query_as_string(
+            self.client, "CORPUS_MAX_ITEMS", kind="macro", wait=WAIT)
+        self.assertNoError(out, "search macro")
+        self.assertIn("CORPUS_MAX_ITEMS", out)
+        self.assertNotIn("no symbols matching", out)
+
+    def test_kind_miss_is_not_reported_as_absence(self):
+        out = run_search_query_as_string(
+            self.client, "Backend", kind="macro", wait=WAIT)
+        self.assertIn("none of kind 'macro'", out)
+        self.assertIn("class", out, "should name the kinds it did find:\n%s" % out)
+
+    def test_limit_bounds_the_output(self):
+        out = run_search_query_as_string(self.client, "log", limit=3, wait=WAIT)
+        self.assertLessEqual(len(self.rows_in(out)), 3,
+                             "limit exceeded:\n%s" % out)
+
+    def test_nonexistent_symbol_reports_clearly(self):
+        out = run_search_query_as_string(self.client, "zzzNoSuchThing", wait=WAIT)
+        self.assertNoError(out, "search miss")
+        self.assertTrue(out.strip(), "a miss returned an empty string")
+        self.assertIn("no symbols matching", out)
 
 
 class TestFunctionQueries(IntegrationBase):

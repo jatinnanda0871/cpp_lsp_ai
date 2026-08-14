@@ -130,6 +130,7 @@ search over the codebase.
          },
          "disabled": false,
          "alwaysAllow": [
+           "search_symbols",
            "get_function_info",
            "get_class_info",
            "get_macro_info",
@@ -152,12 +153,53 @@ instance can serve queries across multiple repos — it keeps one warm
 
 | Tool | Description |
 |---|---|
+| `search_symbols` | Fuzzy symbol search by name or fragment — the entry point when the exact name isn't known yet. Returns qualified names the tools below accept |
 | `get_function_info` | Definition, declaration, references, and callers for a function (plain name or `Class::method`) |
 | `get_class_info` | Declaration location plus definition/refs/callers for every method on a class |
 | `get_macro_info` | Macro declaration location and all usages/expansion sites |
 | `get_struct_info` | Struct declaration/definition location |
 | `get_hover_info` | Type/signature/doc info for a symbol at a specific file position (like IDE hover) |
 | `get_incoming_calls` | All functions/methods that call a given function |
+
+#### `search_symbols` — finding a name to query
+
+Every other tool needs an exact symbol name. `search_symbols` is how an
+assistant gets one without falling back to grep: it fuzzy-matches a name or
+fragment against clangd's index and returns **qualified** names
+(`chain::Backend::process`) that the other tools resolve directly.
+
+| Parameter | Purpose |
+|---|---|
+| `query` | Name or fragment, e.g. `parse`, `Handler` (required) |
+| `kind` | Narrow to one kind: `function`, `method`, `class`, `struct`, `enum`, `variable`, `field`, `namespace`, `macro`, `type` |
+| `limit` | Max rows, default 30, cap 200 |
+
+```
+# 6 symbols matching 'Backend' (any kind), showing 6
+# exact (2):
+  class       chain::Backend                  include/chains.h:19
+  constructor chain::Backend::Backend         src/chains.cpp:6
+# fuzzy -- nothing else is named 'Backend' exactly (4):
+  method      chain::Frontend::setBackend     src/chains.cpp:61
+  field       chain::Frontend::m_backend      include/chains.h:51
+```
+
+Results are split into exact and fuzzy sections, and exact hits are never the
+ones dropped by `limit`. Two behaviours worth knowing:
+
+- **Kinds are what clangd reports, not what the LSP spec says.** clangd files
+  C++ structs (including `typedef struct`) under `class`, so the `struct`
+  filter deliberately matches both — a spec-literal filter finds zero structs
+  in a repo full of them.
+- **Macros are found via a fallback.** `workspace/symbol` never reports a
+  `#define` until its defining file is open, so a miss triggers the same
+  locate-and-open path `get_macro_info` uses. Without it, every macro search
+  would come back as "check the spelling".
+
+A filter that matches nothing says so distinctly from a name that matches
+nothing (`6 symbols match 'Backend', but none of kind 'macro' (found: class,
+constructor, field, method)`), so a too-narrow filter is never mistaken for an
+absent symbol.
 
 ## Notes
 

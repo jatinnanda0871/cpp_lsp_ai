@@ -11,12 +11,17 @@ rather than speculative coverage.
 import io
 import json
 import os
+import sys
 import tempfile
 import threading
 import types
 import unittest
 
-import support
+# So `python3 -m unittest tests.test_unit` works from the repo root, where
+# tests/ is not on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import support  # noqa: E402  (needs the path set up first)
 
 import clangd_query_engine as qe
 from clangd_client import ClangdClient
@@ -658,3 +663,126 @@ class TestFuzzyResultsAreLabelledAndBounded(unittest.TestCase):
         out = io.StringIO()
         qe.run_query(client, "refs", "Backend::process", 1, out=out)
         self.assertIn("Backend::process", out.getvalue())
+
+
+class TestSymbolSearch(unittest.TestCase):
+    """search_symbols is the discovery entry point, so it inverts two rules
+    the other queries follow: a fuzzy hit is the answer rather than a warning,
+    and the output is meant to be fed straight back into the other tools."""
+
+    def sym(self, name, kind=12, container="", line=0, uri="file:///repo/a.cpp"):
+        return {"name": name, "kind": kind, "containerName": container,
+                "location": {"uri": uri,
+                             "range": {"start": {"line": line, "character": 0}}}}
+
+    def search(self, symbols, query, **kwargs):
+        client = FakeQueryClient(symbols=symbols, root="/repo")
+        out = io.StringIO()
+        qe.run_search_query(client, query, out=out, **kwargs)
+        return out.getvalue()
+
+    # ---- names must be usable by the other tools ----
+    def test_names_come_back_qualified(self):
+        """The whole point of the tool: 'process' alone would resolve to some
+        other class's overload when fed to get_function_info."""
+        text = self.search([self.sym("process", 6, "chain::Backend")], "process")
+        self.assertIn("chain::Backend::process", text)
+
+    def test_bare_name_when_there_is_no_container(self):
+        text = self.search([self.sym("parseInt")], "parseInt")
+        self.assertIn("parseInt", text)
+        self.assertNotIn("::parseInt", text)
+
+    def test_container_already_in_the_name_is_not_doubled(self):
+        text = self.search(
+            [self.sym("Backend::process", 6, "Backend")], "process")
+        self.assertIn("Backend::process", text)
+        self.assertNotIn("Backend::Backend::process", text)
+
+    # ---- exact vs fuzzy ----
+    def test_exact_and_fuzzy_are_sectioned(self):
+        text = self.search(
+            [self.sym("process"), self.sym("processedCount")], "process")
+        self.assertIn("# exact", text)
+        self.assertIn("# fuzzy", text)
+
+    def test_exact_matches_win_the_limit_budget(self):
+        """Truncation that dropped the symbol the caller literally named
+        would be worse than no answer at all."""
+        symbols = ([self.sym("hit", 12, "N%d" % i) for i in range(3)] +
+                   [self.sym("hitAdjacent%d" % i) for i in range(10)])
+        text = self.search(symbols, "hit", limit=3)
+        for i in range(3):
+            self.assertIn("N%d::hit" % i, text)
+        self.assertNotIn("hitAdjacent", text)
+
+    # ---- kind filtering ----
+    def test_kind_filter_excludes_other_kinds(self):
+        symbols = [self.sym("Thing", 5), self.sym("ThingMaker", 12)]
+        text = self.search(symbols, "Thing", kind="class")
+        self.assertIn("Thing", text)
+        self.assertNotIn("ThingMaker", text)
+
+    def test_kind_filter_miss_names_the_kinds_it_did_find(self):
+        """Must not read as 'no such symbol' -- the name exists, the filter
+        is what excluded it, and the caller needs to know which to fix."""
+        text = self.search([self.sym("Backend", 6)], "Backend", kind="macro")
+        self.assertIn("none of kind 'macro'", text)
+        self.assertIn("method", text)
+
+    def test_unknown_kind_is_rejected_not_silently_ignored(self):
+        """Falling through to an unfiltered search would return results that
+        disregard the constraint while looking like they honoured it."""
+        text = self.search([self.sym("Thing", 5)], "Thing", kind="klass")
+        self.assertIn("unknown kind", text)
+        self.assertNotIn("Thing  ", text)
+
+    def test_struct_filter_matches_the_kind_clangd_actually_reports(self):
+        """Verified against the corpus: clangd files C++ structs under Class,
+        so a spec-literal {23} filter would report zero structs in a repo
+        full of them."""
+        text = self.search([self.sym("Point", 5)], "Point", kind="struct")
+        self.assertIn("Point", text)
+        self.assertNotIn("none of kind", text)
+
+    def test_unknown_kind_number_is_labelled_not_dropped(self):
+        text = self.search([self.sym("Odd", 99)], "Odd")
+        self.assertIn("Odd", text)
+        self.assertIn("kind99", text)
+
+    # ---- bounding ----
+    def test_limit_truncates_and_reports_the_remainder(self):
+        symbols = [self.sym("Sym%02d" % i) for i in range(20)]
+        text = self.search(symbols, "Sym", limit=5)
+        self.assertIn("15 more not shown", text)
+        self.assertEqual(text.count("file:///repo") + text.count("a.cpp"), 5)
+
+    def test_clangd_result_cap_is_disclosed(self):
+        """At clangd's own cap the list was cut server-side; a caller reading
+        it as complete is how 'that symbol does not exist' gets said wrongly."""
+        symbols = [self.sym("Sym%03d" % i) for i in range(qe.CLANGD_RESULT_CAP)]
+        text = self.search(symbols, "Sym")
+        self.assertIn("not exhaustive", text)
+
+    def test_limit_is_clamped_rather_than_crashing(self):
+        symbols = [self.sym("Sym%02d" % i) for i in range(3)]
+        for bad in (0, -5, "nonsense", None):
+            text = self.search(symbols, "Sym", limit=bad)
+            self.assertIn("Sym00", text, "limit=%r produced: %s" % (bad, text))
+
+    # ---- misses ----
+    def test_no_match_message_is_not_empty(self):
+        text = self.search([], "nothing")
+        self.assertTrue(text.strip(), "a miss returned an empty string")
+        self.assertIn("nothing", text)
+
+    def test_blank_query_is_rejected(self):
+        for blank in ("", "   ", None, 12):
+            text = self.search([self.sym("Thing")], blank)
+            self.assertIn("non-empty query", text, "query=%r" % blank)
+
+    def test_client_without_macro_fallback_still_answers(self):
+        """FakeQueryClient has no resolve_macro; the fallback must degrade to
+        a clean miss rather than an AttributeError."""
+        text = self.search([], "SOME_MACRO")
+        self.assertIn("no symbols matching", text)

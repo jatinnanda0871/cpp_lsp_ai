@@ -10,11 +10,17 @@ server, not the CLI).
     python3 -m unittest tests.test_mcp -v
 """
 import importlib
+import os
+import sys
 import threading
 import time
 import unittest
 
-import support
+# So `python3 -m unittest tests.test_mcp` works from the repo root, where
+# tests/ is not on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import support  # noqa: E402  (needs the path set up first)
 
 try:
     import clangq_mcp
@@ -85,6 +91,47 @@ class TestArgumentHandling(unittest.TestCase):
         out = clangq_mcp._run_tool(
             "get_hover_info", {"root": self.root, "path": "a.cpp", "line": "12", "col": 3})
         self.assertIn("must be an integer", out)
+
+    def test_search_requires_a_query(self):
+        for args in ({}, {"query": None}, {"query": "  "}):
+            args = dict(args, root=self.root)
+            out = clangq_mcp._run_tool("search_symbols", args)
+            self.assertIn("query is required", out, "%r: %s" % (args, out))
+
+    def test_search_rejects_unknown_kind(self):
+        """Must not fall through to an unfiltered search -- results would
+        ignore the constraint while appearing to honour it."""
+        out = clangq_mcp._run_tool(
+            "search_symbols", {"root": self.root, "query": "x", "kind": "klass"})
+        self.assertIn("kind must be one of", out)
+
+    def test_search_rejects_blank_kind(self):
+        """Blank is a caller mistake on an OPTIONAL parameter, not an
+        omission: swapping it for the default would hide the bug."""
+        out = clangq_mcp._run_tool(
+            "search_symbols", {"root": self.root, "query": "x", "kind": ""})
+        self.assertIn("kind must be one of", out)
+
+    def test_search_rejects_out_of_range_limit(self):
+        for bad, expected in ((0, "at least 1"), (-3, "at least 1"),
+                              (clangq_mcp.MAX_SEARCH_LIMIT + 1, "must not exceed")):
+            out = clangq_mcp._run_tool(
+                "search_symbols", {"root": self.root, "query": "x", "limit": bad})
+            self.assertIn(expected, out, "limit=%r: %s" % (bad, out))
+
+    def test_search_rejects_non_integer_limit(self):
+        for bad in ("30", True, 1.5):
+            out = clangq_mcp._run_tool(
+                "search_symbols", {"root": self.root, "query": "x", "limit": bad})
+            self.assertIn("must be an integer", out, "limit=%r: %s" % (bad, out))
+
+    def test_search_is_advertised_with_its_schema(self):
+        """The tool must reach the host's tool list, and its enum must match
+        the filters the engine actually accepts."""
+        spec = clangq_mcp.TOOLS["search_symbols"].as_mcp_tool()
+        self.assertEqual(spec.inputSchema["required"], ["root", "query"])
+        self.assertEqual(sorted(spec.inputSchema["properties"]["kind"]["enum"]),
+                         sorted(clangq_mcp.SEARCH_KIND_FILTERS))
 
 
 @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed: %s" % MCP_IMPORT_ERROR)

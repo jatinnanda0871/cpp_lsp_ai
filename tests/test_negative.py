@@ -16,10 +16,15 @@ and skip without it.
     python3 -m unittest tests.test_negative -v
 """
 import os
+import sys
 import tempfile
 import unittest
 
-import support
+# So `python3 -m unittest tests.test_negative` works from the repo root, where
+# tests/ is not on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import support  # noqa: E402  (needs the path set up first)
 
 import clangd_query_engine as qe
 
