@@ -11,9 +11,11 @@ rather than speculative coverage.
 import io
 import json
 import os
+import queue
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 
@@ -34,6 +36,7 @@ def blank_client():
     c.req_timeout = 2
     c._id = 0
     c._id_lock = threading.Lock()
+    c._send_lock = threading.Lock()
     c._pending = {}
     c._pending_lock = threading.Lock()
     c._opened = {}
@@ -302,6 +305,82 @@ class TestTransportFraming(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             c._request_async("textDocument/hover", {})
         self.assertEqual(len(c._pending), 0, "pending entry leaked after failed send")
+
+
+class TestSendConcurrency(unittest.TestCase):
+    """O2: _send is called from many worker threads (the MCP server's
+    thread pool; one thread per daemon connection since P1). Without
+    _send_lock, two concurrent frames could interleave their bytes on the
+    wire -- this proves the lock actually prevents that, via a deterministic
+    handshake rather than hoping a race shows up under GIL scheduling."""
+
+    def test_concurrent_sends_never_interleave_on_the_wire(self):
+        """Thread A's write is paused mid-frame by a controlled handshake,
+        and thread B's write gets a real window to run while A is paused.
+        With _send_lock, B cannot even start writing until A's whole
+        _send() call (lock held for its entire duration) has returned, so
+        the frames can never interleave; without it, B's write would land
+        inside A's."""
+        first_write_started = threading.Event()
+        resume_first_write = threading.Event()
+
+        class HandshakeStdin:
+            def __init__(self):
+                self.chunks = []
+                self._first_call_done = False
+
+            def write(self, data):
+                if not self._first_call_done:
+                    self._first_call_done = True
+                    mid = len(data) // 2
+                    self.chunks.append(data[:mid])
+                    first_write_started.set()
+                    resume_first_write.wait(5)
+                    self.chunks.append(data[mid:])
+                else:
+                    self.chunks.append(data)
+
+            def flush(self):
+                pass
+
+        c = blank_client()
+        stdin = HandshakeStdin()
+        c.proc = types.SimpleNamespace(stdin=stdin)
+
+        def send_a():
+            c._notify("m", {"who": "A"})
+
+        def send_b():
+            first_write_started.wait(5)
+            c._notify("m", {"who": "B"})
+
+        ta = threading.Thread(target=send_a)
+        tb = threading.Thread(target=send_b)
+        ta.start()
+        tb.start()
+
+        # Give B a real window to attempt its write while A is paused
+        # mid-frame, then let A finish.
+        first_write_started.wait(5)
+        time.sleep(0.1)
+        resume_first_write.set()
+        ta.join(5)
+        tb.join(5)
+
+        # Reassemble the raw byte stream and re-parse every frame. This only
+        # succeeds if each write() landed as one whole, uninterrupted frame --
+        # an interleaved write corrupts framing (a garbled Content-Length, or
+        # a body that fails to parse as JSON).
+        raw = b"".join(stdin.chunks)
+        seen = []
+        while raw:
+            header_end = raw.index(b"\r\n\r\n")
+            length = int(raw[:header_end].split(b"Content-Length:")[1].strip())
+            body = raw[header_end + 4: header_end + 4 + length]
+            seen.append(json.loads(body.decode("utf-8")))
+            raw = raw[header_end + 4 + length:]
+
+        self.assertEqual(sorted(m["params"]["who"] for m in seen), ["A", "B"])
 
 
 class TestFileHandling(unittest.TestCase):
@@ -683,6 +762,278 @@ class TestCliToolsRegistry(unittest.TestCase):
         self.assertEqual(sent.get("cmd"), "tool")
         self.assertEqual(sent.get("tool"), "struct")
         self.assertEqual(sent.get("kwargs"), {"name": "Point", "wait": 7, "verbose": False})
+
+
+class FakeConn:
+    """Stands in for an accepted socket connection: the daemon transport
+    only ever calls .recv()/.sendall()/.close() on one (see _recv_line /
+    _send_json), so a real socket is not needed to test the request/
+    response and threading logic around it."""
+
+    def __init__(self, request_obj):
+        payload = b"" if request_obj is None else (json.dumps(request_obj) + "\n").encode("utf-8")
+        self._buf = payload
+        self.sent = []
+        self.closed = False
+
+    def recv(self, n):
+        chunk, self._buf = self._buf[:n], self._buf[n:]
+        return chunk
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def close(self):
+        self.closed = True
+
+    def response(self):
+        return json.loads(b"".join(self.sent).decode("utf-8").strip())
+
+
+class FakeServerSocket:
+    """accept() blocks on a queue instead of a real socket. push(None)
+    simulates the wake-up connection _signal_stop makes to unblock a real
+    accept() -- it raises OSError, the same as accept() on a closed
+    socket, which is what _accept_loop's own break condition expects."""
+
+    def __init__(self):
+        self._queue = queue.Queue()
+
+    def push(self, conn):
+        self._queue.put(conn)
+
+    def accept(self):
+        conn = self._queue.get()
+        if conn is None:
+            raise OSError("fake socket closed")
+        return conn, None
+
+
+class TestConcurrentDaemonServing(unittest.TestCase):
+    """P1: the daemon used to serve one request at a time -- a slow
+    get_class_info blocked every other CLI invocation against the same
+    daemon for its whole duration, even though ClangdClient is explicitly
+    built to pipeline concurrent requests. Each connection now runs on its
+    own thread; these tests prove that end to end without a real socket
+    (AF_UNIX is unavailable on this platform's Python build)."""
+
+    def _args(self):
+        return types.SimpleNamespace(verbose=False)
+
+    def test_signal_stop_sets_event_and_wakes_the_accept_loop(self):
+        """accept() blocks; without the self-connect, a shutdown request
+        with no further connections would leave the loop hanging forever
+        instead of noticing stop_event."""
+        connected_to = []
+
+        class FakeWakeSocket:
+            def connect(self, path):
+                connected_to.append(path)
+            def close(self):
+                pass
+
+        had_af_unix = hasattr(qe.socket, "AF_UNIX")
+        if not had_af_unix:
+            qe.socket.AF_UNIX = 1  # opaque stand-in; _signal_stop only passes it through
+        real_ctor = qe.socket.socket
+        qe.socket.socket = lambda family, kind: FakeWakeSocket()
+        stop_event = threading.Event()
+        try:
+            qe._signal_stop(stop_event, "/fake/sock/path")
+        finally:
+            qe.socket.socket = real_ctor
+            if not had_af_unix:
+                del qe.socket.AF_UNIX
+
+        self.assertTrue(stop_event.is_set())
+        self.assertEqual(connected_to, ["/fake/sock/path"])
+
+    def test_requests_are_served_concurrently_not_serially(self):
+        """The whole point of P1: a slow request must not delay the
+        response to a second, concurrently-open connection."""
+        gate = threading.Event()
+
+        def _cmd_slow(client, req, args):
+            gate.wait(5)
+            return {"ok": True}, True
+
+        qe.DAEMON_COMMANDS["__test_slow__"] = _cmd_slow
+        try:
+            srv = FakeServerSocket()
+            slow_conn = FakeConn({"cmd": "__test_slow__"})
+            fast_conn = FakeConn({"cmd": "ping"})
+            srv.push(slow_conn)
+            srv.push(fast_conn)
+
+            thread = threading.Thread(
+                target=qe._accept_loop,
+                args=(srv, None, self._args(), "/fake/sock/path"), daemon=True)
+            thread.start()
+            try:
+                for _ in range(300):
+                    if fast_conn.sent:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(fast_conn.sent,
+                                "fast request never answered -- was it blocked behind the slow one?")
+                self.assertTrue(fast_conn.response().get("ok"))
+                self.assertFalse(slow_conn.sent, "slow request answered before its gate opened")
+            finally:
+                gate.set()
+                srv.push(None)  # unblock accept() so the loop thread can exit
+                thread.join(5)
+
+            self.assertTrue(slow_conn.sent, "slow request never got its turn")
+        finally:
+            qe.DAEMON_COMMANDS.pop("__test_slow__", None)
+
+    def test_shutdown_command_stops_the_accept_loop(self):
+        srv = FakeServerSocket()
+        shutdown_conn = FakeConn({"cmd": "shutdown"})
+        srv.push(shutdown_conn)
+
+        def fake_signal_stop(stop_event, sock_path):
+            stop_event.set()
+            srv.push(None)  # what a real self-connect would trigger
+
+        real_signal_stop = qe._signal_stop
+        qe._signal_stop = fake_signal_stop
+        try:
+            thread = threading.Thread(
+                target=qe._accept_loop,
+                args=(srv, None, self._args(), "/fake/sock/path"), daemon=True)
+            thread.start()
+            thread.join(5)
+        finally:
+            qe._signal_stop = real_signal_stop
+
+        self.assertFalse(thread.is_alive(), "accept loop did not stop on shutdown")
+        self.assertTrue(shutdown_conn.sent)
+        self.assertTrue(shutdown_conn.response().get("ok"))
+
+    def test_recv_daemon_response_turns_no_answer_into_a_clean_error(self):
+        """A connection can land in the accept backlog at the same moment
+        the daemon decides to stop (see _accept_loop's stop_event check --
+        whether the loop notices before or after accepting one more
+        connection is an inherent race no server-side effort fully closes).
+        Whatever the daemon does or doesn't send back, the CLIENT must
+        never crash on it: _recv_daemon_response is the actual backstop,
+        not the server's best-effort courtesy message."""
+        class EmptyConn:
+            def recv(self, n):
+                return b""  # what a closed connection with nothing sent looks like
+
+        resp = qe._recv_daemon_response(EmptyConn())
+        self.assertIn("error", resp)
+        self.assertNotIn("Traceback", repr(resp))
+
+        class GarbageConn:
+            def recv(self, n):
+                return b"not json at all\n"
+
+        resp = qe._recv_daemon_response(GarbageConn())
+        self.assertIn("error", resp)
+
+    def test_a_bad_request_does_not_kill_the_accept_loop(self):
+        """A malformed request must not stop the daemon -- it outlives its
+        clients, so anything unhandled here would strand the warm index."""
+        srv = FakeServerSocket()
+        bad_conn = FakeConn(None)
+        bad_conn._buf = b"not json\n"
+        good_conn = FakeConn({"cmd": "ping"})
+        srv.push(bad_conn)
+        srv.push(good_conn)
+
+        thread = threading.Thread(
+            target=qe._accept_loop,
+            args=(srv, None, self._args(), "/fake/sock/path"), daemon=True)
+        thread.start()
+        try:
+            for _ in range(300):
+                if good_conn.sent:
+                    break
+                time.sleep(0.01)
+        finally:
+            srv.push(None)
+            thread.join(5)
+
+        self.assertIn("malformed", bad_conn.response().get("error", ""))
+        self.assertTrue(good_conn.response().get("ok"))
+
+
+class FakeMacroClient:
+    """Tracks call order to prove run_macro_query fires every macro's
+    references_async before awaiting any of them (P3): N matches should
+    cost ~1 round trip, not N serial ones. Every other multi-item path in
+    the module (fetch_refs_and_callers, _class_method_items) already does
+    this; run_macro_query used to be the one that didn't."""
+
+    def __init__(self, macros):
+        self._macros = macros
+        self.root = "/repo"
+        self.calls = []
+
+    def resolve_macro(self, name, deadline_s=10):
+        return self._macros
+
+    def references_async(self, path, line, col, include_decl):
+        self.calls.append(("fire", path))
+        return ("refs", path)
+
+    def wait_result(self, handle, timeout=None):
+        self.calls.append(("await", handle[1]))
+        return []
+
+
+def _macro_sym(name, path, line):
+    return {"name": name, "kind": 15,
+           "location": {"uri": "file://" + path, "range": {"start": {"line": line, "character": 0}}}}
+
+
+class TestMacroQueryConcurrency(unittest.TestCase):
+    def test_fires_all_references_before_awaiting_any(self):
+        macros = [_macro_sym("M1", "/repo/a.h", 1),
+                 _macro_sym("M2", "/repo/b.h", 2),
+                 _macro_sym("M3", "/repo/c.h", 3)]
+        client = FakeMacroClient(macros)
+        out = io.StringIO()
+        qe.run_macro_query(client, "all", "M", 1, out=out)
+
+        fires = [i for i, (kind, _) in enumerate(client.calls) if kind == "fire"]
+        awaits = [i for i, (kind, _) in enumerate(client.calls) if kind == "await"]
+        self.assertEqual(len(fires), 3)
+        self.assertEqual(len(awaits), 3)
+        self.assertLess(max(fires), min(awaits),
+                        "a references_async fired after an earlier one was already "
+                        "awaited -- the two-phase fetch collapsed back into serial "
+                        "round trips:\n%r" % client.calls)
+
+    def test_output_still_covers_every_macro_in_order(self):
+        """The concurrency refactor must not change what gets printed --
+        only when the network calls happen."""
+        macros = [_macro_sym("M1", "/repo/a.h", 1), _macro_sym("M2", "/repo/b.h", 2)]
+        client = FakeMacroClient(macros)
+        out = io.StringIO()
+        qe.run_macro_query(client, "all", "M", 1, out=out)
+        text = out.getvalue()
+        self.assertLess(text.index("M1"), text.index("M2"))
+
+    def test_a_reference_failure_on_one_macro_does_not_affect_another(self):
+        class FlakyClient(FakeMacroClient):
+            def wait_result(self, handle, timeout=None):
+                # "a.h", not the raw fixture path -- uri_to_path normalizes
+                # separators per-platform (e.g. backslashes on Windows).
+                if "a.h" in handle[1]:
+                    raise RuntimeError("boom")
+                return super().wait_result(handle, timeout=timeout)
+
+        macros = [_macro_sym("M1", "/repo/a.h", 1), _macro_sym("M2", "/repo/b.h", 2)]
+        client = FlakyClient(macros)
+        out = io.StringIO()
+        qe.run_macro_query(client, "all", "M", 1, out=out)
+        text = out.getvalue()
+        self.assertIn("query failed", text)
+        self.assertIn("0 references of M2", text)
 
 
 class TestHoverContentShapes(unittest.TestCase):

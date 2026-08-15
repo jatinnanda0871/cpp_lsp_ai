@@ -8,9 +8,11 @@ cannot drift apart.
     call_tool -> asyncio.to_thread -> _run_tool -> handler -> query engine
 """
 import asyncio
+import atexit
 import os
 import sys
 import threading
+import time
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -59,47 +61,117 @@ DIAGNOSTICS_WAIT_S = 30
 
 VALID_MODES = ("refs", "callers", "all")
 
+# A warm clangd holds a full semantic index in RAM -- 1-4GB is ordinary on a
+# large C++ repo. Left unchecked, an assistant that touches several repos in
+# one session accumulates one clangd per repo forever. These bound that:
+# an idle client is reclaimed after CLIENT_IDLE_TIMEOUT_S, and the number of
+# simultaneously warm roots is capped, evicting least-recently-used first.
+CLIENT_IDLE_TIMEOUT_S = int(os.environ.get("CLANGQ_IDLE_TIMEOUT", str(60 * 60)))
+MAX_WARM_CLIENTS = int(os.environ.get("CLANGQ_MAX_CLIENTS", "8"))
+# How often the idle reaper sweeps -- independent of the timeout above so
+# one can be tuned without changing how promptly the other is enforced.
+IDLE_REAPER_INTERVAL_S = 60
+
 server = Server("clangq")
 
 
 # ======================= warm clangd per repo root =======================
 # Indexing is the expensive part, so one client stays alive per root.
-_clients = {}
+_clients = {}       # normalized root -> ClangdClient
+_last_used = {}      # normalized root -> time.monotonic() of last get_client()
 _client_locks = {}
 _clients_lock = threading.Lock()
 
 
-def _lock_for(root):
-    """Startup lock for one root. Per-root, so a cold start for one repo
-    doesn't block queries against an already-warm one."""
+def _normalize_root(root):
+    """Canonical dict key for `root`.
+
+    Without this, '/repo', '/repo/', and (on Windows, or through a symlink)
+    a different case or separator spelling of the same path each get their
+    own clangd holding their own multi-GB index for what is really one repo.
+    """
+    return os.path.normcase(os.path.realpath(root))
+
+
+def _lock_for(key):
+    """Startup lock for one (already-normalized) root. Per-root, so a cold
+    start for one repo doesn't block queries against an already-warm one.
+
+    Also the lock the idle reaper and the LRU evictor take before shutting a
+    client down, so a client can never be closed out from under a
+    get_client() call that is concurrently mid-flight for the same root --
+    see _pop_and_shutdown.
+    """
     with _clients_lock:
-        if root not in _client_locks:
-            _client_locks[root] = threading.Lock()
-        return _client_locks[root]
+        if key not in _client_locks:
+            _client_locks[key] = threading.Lock()
+        return _client_locks[key]
+
+
+def _pop_and_shutdown(key):
+    """Remove `key`'s client (if any) from the cache and shut it down.
+
+    Callers must already hold _lock_for(key) -- this only does the (brief,
+    _clients_lock-guarded) bookkeeping and the (slow) shutdown, it doesn't
+    itself serialize against a concurrent get_client() for the same root.
+    """
+    with _clients_lock:
+        client = _clients.pop(key, None)
+        _last_used.pop(key, None)
+    if client is not None:
+        try:
+            client.shutdown()
+        except Exception:
+            pass
+    return client is not None
+
+
+def _evict_lru_if_over_capacity():
+    """Free a slot for a new client if the cap is already full.
+
+    Called right before starting a new client for a root that isn't in
+    _clients yet, so that root can never select itself as the victim.
+    """
+    while True:
+        with _clients_lock:
+            if len(_clients) < MAX_WARM_CLIENTS:
+                return
+            victim_key = min(_last_used, key=lambda k: _last_used[k], default=None)
+        if victim_key is None:
+            return
+        with _lock_for(victim_key):
+            _pop_and_shutdown(victim_key)
+        # Loop back rather than assume success: capacity may already have
+        # been freed by another thread (or this eviction) by now.
 
 
 def get_client(root):
     """The warm client for `root`, started or replaced as needed.
 
-    Locked because tool calls run in worker threads: two concurrent
-    first-time calls would otherwise start two clangd processes.
+    Locked per-root because tool calls run in worker threads: two
+    concurrent first-time calls for the SAME root would otherwise start two
+    clangd processes, while a cold start for one root must not block
+    queries against an already-warm, unrelated one.
     """
-    with _lock_for(root):
-        client = _clients.get(root)
+    key = _normalize_root(root)
+    with _lock_for(key):
+        with _clients_lock:
+            client = _clients.get(key)
 
         # A dead clangd would fail every later request, so retire it.
         if client is not None and not client.is_alive():
-            try:
-                client.shutdown()
-            except Exception:
-                pass
-            del _clients[root]
+            _pop_and_shutdown(key)
             client = None
 
         if client is None:
+            _evict_lru_if_over_capacity()
             client = ClangdClient(root, request_timeout=REQUEST_TIMEOUT_S).start()
             client.prime_index()
-            _clients[root] = client
+            with _clients_lock:
+                _clients[key] = client
+
+        with _clients_lock:
+            _last_used[key] = time.monotonic()
         return client
 
 
@@ -108,11 +180,76 @@ def shutdown_all_clients():
     with _clients_lock:
         clients = list(_clients.values())
         _clients.clear()
+        _last_used.clear()
     for client in clients:
         try:
             client.shutdown()
         except Exception:
             pass
+
+
+# Belt-and-suspenders with main()'s own `finally`: atexit still runs if the
+# process exits some other way (an unhandled exception before main's own
+# cleanup, an interpreter-level shutdown). shutdown_all_clients() is
+# idempotent (it clears _clients first), so running it twice is harmless.
+atexit.register(shutdown_all_clients)
+
+
+def _reap_idle_clients(now=None, timeout_s=None):
+    """Shut down and evict every client idle longer than timeout_s.
+
+    A pure sweep -- callable directly (by the reaper thread below, or a
+    test with a fake `now`) without waiting out a real interval. Returns
+    the number of clients reaped.
+    """
+    now = time.monotonic() if now is None else now
+    timeout_s = CLIENT_IDLE_TIMEOUT_S if timeout_s is None else timeout_s
+
+    with _clients_lock:
+        candidates = [key for key, last in _last_used.items()
+                     if now - last >= timeout_s]
+
+    reaped = 0
+    for key in candidates:
+        with _lock_for(key):
+            with _clients_lock:
+                last = _last_used.get(key)
+            # Re-check under the per-root lock: a concurrent get_client()
+            # may have refreshed last_used, or already retired this client,
+            # since the unlocked scan above.
+            if last is None or now - last < timeout_s:
+                continue
+            if _pop_and_shutdown(key):
+                reaped += 1
+    return reaped
+
+
+_reaper_started = False
+_reaper_start_lock = threading.Lock()
+_reaper_stop_event = threading.Event()
+
+
+def _idle_reaper_loop():
+    while not _reaper_stop_event.wait(IDLE_REAPER_INTERVAL_S):
+        try:
+            _reap_idle_clients()
+        except Exception:
+            pass
+
+
+def start_idle_reaper():
+    """Start the background idle-client reaper, once.
+
+    Not started at import time: importing this module (as the tests do)
+    should not spin up a live background thread whose only job is
+    reclaiming RAM for a long-lived server process. main() starts it.
+    """
+    global _reaper_started
+    with _reaper_start_lock:
+        if _reaper_started:
+            return
+        _reaper_started = True
+        threading.Thread(target=_idle_reaper_loop, daemon=True).start()
 
 
 # ============================= parameters =============================
@@ -533,6 +670,7 @@ async def call_tool(name: str, arguments: dict):
     return [types.TextContent(type="text", text=result)]
 
 async def main():
+    start_idle_reaper()
     try:
         async with stdio_server() as (read, write):
             await server.run(read, write, server.create_initialization_options())
@@ -540,6 +678,10 @@ async def main():
         print("clangq_mcp main() crashed: %s" % e, file=sys.stderr)
     except BaseException as e:
         print("clangq_mcp main() crashed: %s" % e, file=sys.stderr)
+    finally:
+        # The atexit hook is the safety net; this makes normal shutdown
+        # immediate rather than waiting on interpreter-exit handling.
+        shutdown_all_clients()
 
 if __name__ == "__main__":
     try:

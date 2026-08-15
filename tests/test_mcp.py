@@ -298,6 +298,166 @@ class TestWarmClientCache(unittest.TestCase):
 
 
 @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed: %s" % MCP_IMPORT_ERROR)
+class TestClientIdleLifecycle(unittest.TestCase):
+    """A warm clangd holds a full index in RAM (1-4GB on a large repo). An
+    assistant that touches several repos in a session must not accumulate
+    one clangd per repo forever: idle clients get reaped, the number of
+    simultaneously warm roots is capped, and every client is reachable
+    through exactly one normalized key regardless of path spelling."""
+
+    def setUp(self):
+        importlib.reload(clangq_mcp)
+        self.created = []
+        outer = self
+
+        class FakeClangd:
+            def __init__(self, root, request_timeout=None):
+                self.root = root
+                self.request_timeout = request_timeout
+                self._alive = True
+                self.shutdown_called = False
+                outer.created.append(self)
+
+            def start(self):
+                return self
+
+            def prime_index(self):
+                pass
+
+            def is_alive(self):
+                return self._alive
+
+            def shutdown(self):
+                self.shutdown_called = True
+
+        self.FakeClangd = FakeClangd
+        clangq_mcp.ClangdClient = FakeClangd
+        clangq_mcp._clients.clear()
+        clangq_mcp._last_used.clear()
+        clangq_mcp._client_locks.clear()
+
+    def test_path_spelling_variants_share_one_client(self):
+        """'/repo' and '/repo/' (or a different case on Windows) are the
+        same repo and must not each spawn their own clangd."""
+        a = clangq_mcp.get_client(support.CORPUS_DIR)
+        b = clangq_mcp.get_client(support.CORPUS_DIR + os.sep)
+        self.assertIs(a, b)
+        self.assertEqual(len(self.created), 1)
+
+    def test_last_used_is_recorded_on_every_call(self):
+        clangq_mcp.get_client("/repoA")
+        key = clangq_mcp._normalize_root("/repoA")
+        self.assertIn(key, clangq_mcp._last_used)
+
+    def test_shutdown_all_clients_clears_last_used_too(self):
+        """A stale entry left in _last_used after shutdown would make the
+        idle reaper (or the LRU evictor) try to act on a client that no
+        longer exists."""
+        clangq_mcp.get_client("/repoA")
+        clangq_mcp.shutdown_all_clients()
+        self.assertEqual(clangq_mcp._clients, {})
+        self.assertEqual(clangq_mcp._last_used, {})
+
+    def test_shutdown_all_clients_shuts_down_every_client(self):
+        clangq_mcp.get_client("/repoA")
+        clangq_mcp.get_client("/repoB")
+        clangq_mcp.shutdown_all_clients()
+        self.assertTrue(all(c.shutdown_called for c in self.created))
+
+    def test_shutdown_all_clients_is_idempotent(self):
+        clangq_mcp.get_client("/repoA")
+        clangq_mcp.shutdown_all_clients()
+        clangq_mcp.shutdown_all_clients()  # must not raise on an empty cache
+
+    def test_idle_client_is_reaped(self):
+        clangq_mcp.get_client("/repoA")
+        key = clangq_mcp._normalize_root("/repoA")
+        far_future = clangq_mcp._last_used[key] + clangq_mcp.CLIENT_IDLE_TIMEOUT_S + 1
+        reaped = clangq_mcp._reap_idle_clients(now=far_future)
+        self.assertEqual(reaped, 1)
+        self.assertNotIn(key, clangq_mcp._clients)
+        self.assertTrue(self.created[0].shutdown_called)
+
+    def test_fresh_client_is_not_reaped(self):
+        clangq_mcp.get_client("/repoA")
+        reaped = clangq_mcp._reap_idle_clients(now=time.monotonic())
+        self.assertEqual(reaped, 0)
+        self.assertFalse(self.created[0].shutdown_called)
+
+    def test_reap_only_affects_clients_past_the_timeout(self):
+        clangq_mcp.get_client("/repoA")
+        key_a = clangq_mcp._normalize_root("/repoA")
+        # Backdate A past the timeout; leave B fresh.
+        clangq_mcp._last_used[key_a] -= clangq_mcp.CLIENT_IDLE_TIMEOUT_S + 1
+        clangq_mcp.get_client("/repoB")
+
+        reaped = clangq_mcp._reap_idle_clients(now=time.monotonic())
+        self.assertEqual(reaped, 1)
+        self.assertEqual(len(clangq_mcp._clients), 1)
+        self.assertTrue(self.created[0].shutdown_called, "idle client A should be reaped")
+        self.assertFalse(self.created[1].shutdown_called, "fresh client B should survive")
+
+    def test_capacity_cap_evicts_the_least_recently_used(self):
+        clangq_mcp.MAX_WARM_CLIENTS = 2
+        clangq_mcp.get_client("/repoA")
+        clangq_mcp.get_client("/repoB")
+        # Touch B again so A becomes the least recently used.
+        time.sleep(0.01)
+        clangq_mcp.get_client("/repoB")
+        time.sleep(0.01)
+        clangq_mcp.get_client("/repoC")  # over capacity: should evict A, not B
+
+        self.assertEqual(len(clangq_mcp._clients), 2)
+        client_a = self.created[0]
+        self.assertTrue(client_a.shutdown_called, "least-recently-used client was not evicted")
+        key_b = clangq_mcp._normalize_root("/repoB")
+        key_c = clangq_mcp._normalize_root("/repoC")
+        self.assertIn(key_b, clangq_mcp._clients)
+        self.assertIn(key_c, clangq_mcp._clients)
+
+    def test_capacity_cap_does_not_evict_below_the_limit(self):
+        clangq_mcp.MAX_WARM_CLIENTS = 8
+        for i in range(clangq_mcp.MAX_WARM_CLIENTS):
+            clangq_mcp.get_client("/repo%d" % i)
+        self.assertEqual(len(clangq_mcp._clients), clangq_mcp.MAX_WARM_CLIENTS)
+        self.assertTrue(all(not c.shutdown_called for c in self.created))
+
+    def test_start_idle_reaper_starts_exactly_one_thread(self):
+        """Called from main() -- must be safe to call more than once
+        without accumulating background threads."""
+        calls = []
+
+        def fake_loop():
+            calls.append(1)
+
+        real_loop = clangq_mcp._idle_reaper_loop
+        clangq_mcp._idle_reaper_loop = fake_loop
+        try:
+            clangq_mcp.start_idle_reaper()
+            clangq_mcp.start_idle_reaper()
+            for _ in range(50):
+                if calls:
+                    break
+                time.sleep(0.01)
+        finally:
+            clangq_mcp._idle_reaper_loop = real_loop
+
+        self.assertEqual(len(calls), 1)
+
+    def test_atexit_shutdown_is_registered(self):
+        """D9's fix: shutdown_all_clients must run even if the server exits
+        some way other than main()'s own `finally` below."""
+        import inspect
+        self.assertIn("atexit.register(shutdown_all_clients)", inspect.getsource(clangq_mcp))
+
+    def test_main_shuts_down_clients_and_starts_the_reaper(self):
+        import inspect
+        source = inspect.getsource(clangq_mcp.main)
+        self.assertIn("start_idle_reaper()", source)
+        self.assertIn("shutdown_all_clients()", source)
+
+
+@unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed: %s" % MCP_IMPORT_ERROR)
 class TestCliMatchesMcpFeatureSet(unittest.TestCase):
     """clangd_query_engine.py (the CLI) and clangq_mcp.py (the MCP server)
     are two front ends on the same query engine. A query reachable from one

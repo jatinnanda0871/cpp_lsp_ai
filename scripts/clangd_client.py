@@ -42,6 +42,7 @@ class ClangdClient:
         self.req_timeout = request_timeout
         self._id = 0
         self._id_lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._pending = {}
         self._pending_lock = threading.Lock()
         # uri -> (stat stamp, version). The stamp is what makes a re-query
@@ -75,10 +76,24 @@ class ClangdClient:
 
     # ---- framing --------------------------------------------------------
     def _send(self, msg):
+        """Write one framed LSP message to clangd's stdin.
+
+        Locked because this is called from many worker threads (the MCP
+        server's asyncio.to_thread pool; now also one thread per daemon
+        connection, see clangd_query_engine.serve). Without the lock, two
+        concurrent frames could interleave their bytes on the wire -- a
+        single write() call is atomic under BufferedWriter's own internal
+        lock, which is why header+data are concatenated into one call
+        rather than written separately, but two SEPARATE write() calls
+        racing each other are not atomic with respect to one another. The
+        lock makes "one call" and "one call at a time" both true, rather
+        than relying on the former alone.
+        """
         data = json.dumps(msg).encode("utf-8")
         header = ("Content-Length: %d\r\n\r\n" % len(data)).encode("utf-8")
-        self.proc.stdin.write(header + data)
-        self.proc.stdin.flush()
+        with self._send_lock:
+            self.proc.stdin.write(header + data)
+            self.proc.stdin.flush()
 
     def _next_id(self):
         with self._id_lock:
