@@ -353,6 +353,81 @@ class TestHostileInputAgainstRealClangd(unittest.TestCase):
             with self.subTest(label):
                 self.check("get_incoming_calls", value)
 
+    def test_implementations_survives_hostile_names(self):
+        for label, value in self.HOSTILE:
+            with self.subTest(label):
+                self.check("get_implementations", value)
+
+    def test_enum_survives_hostile_names(self):
+        for label, value in self.HOSTILE:
+            with self.subTest(label):
+                self.check("get_enum_info", value)
+
+    def check_path(self, tool, path):
+        out = clangq_mcp._run_tool(tool, {"root": self.ROOT, "path": path})
+        self.assertIsInstance(out, str)
+        self.assertTrue(out.strip(), "%s(%r) returned EMPTY" % (tool, path))
+        for bad in LEAKED:
+            self.assertNotIn(bad, out, "%s(%r) leaked %r:\n%s" % (tool, path, bad, out))
+        return out
+
+    HOSTILE_PATHS = [
+        ("does not exist", "does_not_exist_zz9.cpp"),
+        ("path traversal", "../../../etc/passwd"),
+        ("null byte", "foo\x00bar.cpp"),
+        ("very long", "a" * 500 + ".cpp"),
+        ("a directory", "include"),
+        ("embedded newline", "foo\nbar.cpp"),
+    ]
+
+    def test_switch_header_survives_hostile_paths(self):
+        for label, value in self.HOSTILE_PATHS:
+            with self.subTest(label):
+                self.check_path("switch_source_header", value)
+
+    def test_includes_survives_hostile_paths(self):
+        for label, value in self.HOSTILE_PATHS:
+            with self.subTest(label):
+                self.check_path("get_includes", value)
+
+    def test_rename_survives_hostile_names(self):
+        for label, value in self.HOSTILE:
+            with self.subTest(label):
+                out = clangq_mcp._run_tool(
+                    "preview_rename", {"root": self.ROOT, "name": value, "new_name": "renamed"})
+                self.assertIsInstance(out, str)
+                self.assertTrue(out.strip(), "preview_rename(%r) returned EMPTY" % value)
+                for bad in LEAKED:
+                    self.assertNotIn(bad, out, "preview_rename(%r) leaked %r:\n%s" % (value, bad, out))
+
+    def test_rename_rejects_hostile_new_names(self):
+        """new_name is validated as a C++ identifier before it ever reaches
+        clangd. Most of HOSTILE fail that check outright; a blank string is
+        "missing" rather than "invalid" (same convention as every other
+        required param); a long run of plain letters IS a syntactically
+        valid identifier, so it is expected to proceed rather than be
+        rejected -- the assertion here is just "no crash, nothing leaked"."""
+        for label, value in self.HOSTILE:
+            with self.subTest(label):
+                out = clangq_mcp._run_tool(
+                    "preview_rename", {"root": self.ROOT, "name": "process", "new_name": value})
+                self.assertIsInstance(out, str)
+                self.assertTrue(out.strip(), "preview_rename new_name=%r returned EMPTY" % value)
+                for bad in LEAKED:
+                    self.assertNotIn(bad, out, "preview_rename new_name=%r leaked %r:\n%s" % (value, bad, out))
+                if isinstance(value, str) and not value.strip():
+                    self.assertIn("new_name is required", out, "%s: %s" % (label, out))
+                elif clangq_mcp._IDENTIFIER_RE.match(value):
+                    self.assertIn("PREVIEW ONLY", out, "%s: %s" % (label, out))
+                else:
+                    self.assertIn("must be a valid C++ identifier", out, "%s: %s" % (label, out))
+
+    def test_rename_of_overload_set_is_refused_not_guessed(self):
+        out = clangq_mcp._run_tool(
+            "preview_rename", {"root": self.ROOT, "name": "add", "new_name": "renamedAdd"})
+        self.assertIn("ambiguous", out)
+        self.assertNotIn("PREVIEW ONLY", out)
+
     def test_nonsense_name_is_flagged_as_inexact(self):
         """'::' fuzzy-matches something; the answer must say so."""
         out = self.check("get_function_info", "::")

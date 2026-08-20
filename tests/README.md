@@ -98,7 +98,7 @@ lookup:
 | `overloads.h/.cpp` | a 4-way overload set, `const`/non-`const` pair, `static` methods, operator overloads |
 | `containers.h/.cpp` | class and function templates, and a **nested** class (`Registry::Entry`) |
 | `namespaced.h/.cpp` | nested namespaces, a pure interface, multiple inheritance |
-| `util.h/.cpp` | object-like and function-like macros, a plain struct, a `typedef struct`, and deliberately unused/undefined symbols |
+| `util.h/.cpp` | object-like and function-like macros, a plain struct, a `typedef struct`, a scoped enum with an explicit value gap, and deliberately unused/undefined symbols |
 | `chains.h/.cpp` | call chains with **exact known caller counts** |
 | `big.h/.cpp` | long method bodies (~40 lines) next to one-line ones, to check reported line spans |
 | `main.cpp` | ties it together so references and call sites actually exist |

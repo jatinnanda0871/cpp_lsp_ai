@@ -46,6 +46,15 @@ struct OrphanStruct {
     int unused_field;
 };
 
+// scoped enum with an explicit value gap, to check members report the
+// right value (or, for Low/High, whatever clangd fills in when there is
+// no explicit initializer).
+enum class Severity {
+    Low,
+    Medium = 5,
+    High
+};
+
 namespace util {
 
 // free functions, declared here and defined in util.cpp

@@ -22,6 +22,7 @@ First query is slow (clangd indexes); the daemon keeps it warm thereafter.
 import sys
 import os
 import io
+import re
 import time
 import json
 import socket
@@ -390,6 +391,79 @@ def run_incoming_calls_query(client, name, wait, verbose=False, out=None):
         print_refs_and_callers(it, it["label"], "callers", base, out)
 
 
+# ========================= implementations =========================
+def run_implementations_query(client, name, wait, verbose=False, out=None):
+    """Overriding definitions of a virtual method/function -- the answer to
+    'who implements this' as opposed to get_incoming_calls's 'who calls this'.
+    """
+    base = client_root(client)
+    out = out or sys.stdout
+
+    positions, notes = _resolve_or_report(
+        client, name, wait, verbose, out, "  no symbol matching %r")
+    if not positions:
+        return
+    for note in notes:
+        print(note, file=out)
+
+    # Unlike prepareCallHierarchy (which needs a definition with a body),
+    # clangd resolves textDocument/implementation from any occurrence of the
+    # symbol -- the primary (path, line, col) resolve_position already
+    # anchored on, which for a pure virtual with no body IS its declaration.
+    # (There is no decl_col to pair with decl_line, so reusing the decl
+    # position here would anchor col on the wrong token.)
+    items = [{
+        "anchor": (path, line, col),
+        "label": found_name if notes else name,
+    } for (path, line, col, _end, _decl_path, _decl_line, found_name) in positions]
+
+    for it in items:
+        p, l, c = it["anchor"]
+        try:
+            it["impl_handle"] = client.implementation_async(p, l, c)
+        except Exception as e:
+            it["impl_error"] = e
+
+    for it in items:
+        handle = it.pop("impl_handle", None)
+        if handle is not None:
+            it["impls"] = _await(client, handle, default=[]) or []
+        else:
+            it["impls"] = []
+
+    # Resolve each hit's enclosing symbol name via one documentSymbol fetch
+    # per unique file -- same two-phase batching as _class_method_items.
+    all_hits = [(uri_to_path(h.get("uri", "")),
+                 ((h.get("range") or {}).get("start") or {}).get("line") or 0)
+                for it in items for h in it["impls"]]
+    doc_handles = {}
+    for hit_path, _line in all_hits:
+        if hit_path and hit_path not in doc_handles:
+            try:
+                doc_handles[hit_path] = client.document_symbol_async(hit_path)
+            except Exception:
+                pass
+    doc_symbols = {p: _await(client, h, default=[]) for p, h in doc_handles.items()}
+
+    def hit_label(hit_path, hit_line):
+        node = client._find_node_by_range_start(doc_symbols.get(hit_path) or [], hit_line)
+        return node.get("name") if node else None
+
+    for it in items:
+        label = it["label"]
+        if "impl_error" in it:
+            print("  implementations of %s: query failed (%s)" % (label, it["impl_error"]), file=out)
+            continue
+        impls = it["impls"]
+        print("%d implementation%s of %s" % (len(impls), "" if len(impls) == 1 else "s", label), file=out)
+        for h in impls:
+            hit_path = uri_to_path(h.get("uri", ""))
+            hit_line = ((h.get("range") or {}).get("start") or {}).get("line") or 0
+            name_hint = hit_label(hit_path, hit_line)
+            where = "%s:%d" % (display_path(hit_path, base), hit_line + 1)
+            print("  %-30s %s" % (name_hint, where) if name_hint else "  " + where, file=out)
+
+
 # ========================= class queries =========================
 def _class_method_items(client, class_path, methods):
     """A class's child symbols as items anchored on each method's DEFINITION.
@@ -648,6 +722,123 @@ def run_struct_query(client, name, wait, verbose=False, out=None):
         if detail:
             print("#   detail: %s" % detail, file=out)
         print("", file=out)
+
+
+# ========================= enum queries =========================
+def run_enum_query(client, name, wait, verbose=False, out=None):
+    """Declaration site of an enum, plus its members."""
+    base = client_root(client)
+    out = out or sys.stdout
+
+    try:
+        enums = client.resolve_enum(name, deadline_s=wait)
+    except Exception as e:
+        print("  resolve failed for %r (%s)" % (name, e), file=out)
+        return
+
+    if not enums:
+        print("  no enum found matching %r (no enum by that name in clangd's "
+              "index -- check the spelling or the --root)" % name, file=out)
+        return
+
+    if not exact_matches(enums, name):
+        print(inexact_match_note(enums, name), file=out)
+
+    if len(enums) > 1 and verbose:
+        sys.stderr.write("note: %d enum matches for %r\n" % (len(enums), name))
+        for s in enums:
+            sys.stderr.write("  %s\n" % item_str(s, base))
+
+    for enum_sym in enums:
+        loc = enum_sym.get("location") or {}
+        path = uri_to_path(loc.get("uri", ""))
+        line = (((loc.get("range") or {}).get("start") or {}).get("line")) or 0
+        found_name = enum_sym.get("name") or name
+
+        print("# %s (enum decl %s:%d)"
+              % (found_name, display_path(path, base), line + 1), file=out)
+        detail = enum_sym.get("detail", "")
+        if detail:
+            print("#   detail: %s" % detail, file=out)
+
+        try:
+            _end_line, members = client.get_enum_end_and_members(path, line)
+        except Exception as e:
+            print("#   members: query failed (%s)" % e, file=out)
+            print("", file=out)
+            continue
+
+        if not members:
+            print("#   no members found (documentSymbol returned none for this enum)", file=out)
+        else:
+            print("  %d member%s (in declaration order; clangd's documentSymbol does "
+                  "not expose explicit values here -- hover on a member for its value):"
+                  % (len(members), "" if len(members) == 1 else "s"), file=out)
+            for m in members:
+                print("    %s" % m["name"], file=out)
+        print("", file=out)
+
+
+# ========================= header/source switching =========================
+def run_switch_header_query(client, path, wait=10, verbose=False, out=None):
+    """The counterpart header/source file for `path` (clangd extension)."""
+    base = client_root(client)
+    out = out or sys.stdout
+    path = resolve_input_path(client, path)
+
+    try:
+        counterpart = client.switch_source_header(path, timeout=wait)
+    except Exception as e:
+        print("  switch-header query failed (%s)" % e, file=out)
+        return
+
+    where = display_path(path, base)
+    if not counterpart:
+        print("  no counterpart file for %s (clangd has none -- the file may "
+              "be header-only, generated, or outside compile_commands.json)"
+              % where, file=out)
+        return
+
+    print("# %s  <->  %s" % (where, display_path(counterpart, base)), file=out)
+
+
+# ========================= include graph =========================
+def run_includes_query(client, path, wait=10, verbose=False, out=None):
+    """What `path` includes, and what includes `path`.
+
+    Both directions are a text scan, not a clangd query (see
+    ClangdClient.list_includes/find_includers) -- best-effort, does not
+    evaluate #ifdef, and a shared basename in two directories is ambiguous.
+    """
+    base = client_root(client)
+    out = out or sys.stdout
+    path = resolve_input_path(client, path)
+    where = display_path(path, base)
+
+    if not os.path.exists(path):
+        print("  %s does not exist" % where, file=out)
+        return
+
+    try:
+        includes = client.list_includes(path)
+    except Exception as e:
+        print("  could not read %s (%s)" % (where, e), file=out)
+        return
+
+    print("# Includes of %s (%d)" % (where, len(includes)), file=out)
+    for spelling, is_system in includes:
+        print("  %s%s%s" % ("<" if is_system else '"', spelling,
+                             ">" if is_system else '"'), file=out)
+    print("", file=out)
+
+    includers = client.find_includers(path)
+    print("# Included by %s (%d)  [text scan -- see note below]" % (where, len(includers)), file=out)
+    for includer_path, lineno in includers:
+        print("  %s:%d" % (display_path(includer_path, base), lineno), file=out)
+    print("", file=out)
+    print("# note: both directions are a text scan of #include lines, not clangd's "
+          "index -- #ifdef'd-out includes are not evaluated, and two files sharing "
+          "a basename in different directories are indistinguishable here.", file=out)
 
 
 # ========================= symbol search =========================
@@ -1093,6 +1284,100 @@ def run_hover_query(client, path, line, col, wait=10, verbose=False, out=None):
     print("# Content:\n%s" % _hover_text(hover.get("contents", "")), file=out)
 
 
+# ========================= rename (preview only) =========================
+# A rename anchored on the wrong symbol is a materially worse failure than a
+# read query guessing wrong -- every other query here falls back to a fuzzy
+# or first-candidate match, this one refuses instead of guessing.
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_]\w*$")
+
+
+def _rename_edits_by_file(edit):
+    """WorkspaceEdit -> {path: [TextEdit, ...]}. clangd may return either
+    `changes` or `documentChanges`; only one is populated per reply."""
+    out = {}
+    changes = edit.get("changes")
+    if isinstance(changes, dict):
+        for uri, edits in changes.items():
+            out[uri_to_path(uri)] = list(edits or [])
+        return out
+    for dc in edit.get("documentChanges") or []:
+        td = dc.get("textDocument") or {}
+        uri = td.get("uri")
+        if uri:
+            out[uri_to_path(uri)] = list(dc.get("edits") or [])
+    return out
+
+
+def run_rename_query(client, name, new_name, wait, verbose=False, out=None):
+    """Preview a workspace-wide rename: every edit site clangd computed.
+    Never writes to disk -- apply the listed edits yourself."""
+    base = client_root(client)
+    out = out or sys.stdout
+
+    if not isinstance(new_name, str) or not _IDENTIFIER_RE.match(new_name):
+        print("  %r is not a valid C++ identifier for --new-name" % (new_name,), file=out)
+        return
+
+    try:
+        symbols = client.resolve_symbol(name, deadline_s=wait)
+    except Exception as e:
+        print("  resolve failed for %r (%s)" % (name, e), file=out)
+        return
+    if not symbols:
+        print("  no symbol matching %r (raise --wait, or check --ccdir)" % name, file=out)
+        return
+
+    exact = exact_matches(symbols, name)
+    if not exact:
+        print("  no EXACT match for %r -- rename refuses to guess from a fuzzy "
+              "match (closest: %s)"
+              % (name, ", ".join(sorted({s.get("name", "?") for s in symbols[:5]}))), file=out)
+        return
+    if len(exact) > 1:
+        print("  %r is ambiguous (%d exact matches) -- rename refuses to pick one; "
+              "qualify it (e.g. Class::%s):" % (name, len(exact), name), file=out)
+        for s in exact:
+            print("    " + item_str(s, base), file=out)
+        return
+
+    sym = exact[0]
+    if sym.get("kind") == 15:  # macro (see resolve_macro's docstring on kind 15)
+        print("  %r is a macro -- clangd's rename is AST-based and does not "
+              "follow macro expansions; edit the #define directly instead" % name, file=out)
+        return
+
+    loc = sym.get("location") or {}
+    path = uri_to_path(loc.get("uri", ""))
+    start = (loc.get("range") or {}).get("start") or {}
+    line, col = start.get("line") or 0, start.get("character") or 0
+
+    try:
+        edit = client.wait_result(client.rename_async(path, line, col, new_name), timeout=wait) or {}
+    except Exception as e:
+        print("  rename query failed (%s)" % e, file=out)
+        return
+
+    by_file = _rename_edits_by_file(edit)
+    total = sum(len(v) for v in by_file.values())
+    if not total:
+        print("  clangd returned no edits for renaming %r -- nothing to preview" % name, file=out)
+        return
+
+    print("# PREVIEW ONLY -- nothing written to disk; apply these edits yourself", file=out)
+    print("# renaming %r -> %r: %d edit%s across %d file%s"
+          % (name, new_name, total, "" if total == 1 else "s",
+             len(by_file), "" if len(by_file) == 1 else "s"), file=out)
+    for fpath in sorted(by_file):
+        edits = sorted(by_file[fpath],
+                       key=lambda e: (((e.get("range") or {}).get("start") or {}).get("line") or 0,
+                                      ((e.get("range") or {}).get("start") or {}).get("character") or 0))
+        print("\n%s (%d edit%s):" % (display_path(fpath, base), len(edits), "" if len(edits) == 1 else "s"), file=out)
+        for e in edits:
+            s = (e.get("range") or {}).get("start") or {}
+            print("  %d:%d  %s -> %s" % ((s.get("line") or 0) + 1, (s.get("character") or 0) + 1,
+                                          name, new_name), file=out)
+
+
 # ==================== string wrappers (used by the MCP server) ===========
 def _as_string(fn, *args, **kwargs):
     buf = io.StringIO()
@@ -1123,6 +1408,26 @@ def run_hover_query_as_string(client, path, line, col, wait=10, verbose=False):
 
 def run_incoming_calls_query_as_string(client, name, wait=120, verbose=False):
     return _as_string(run_incoming_calls_query, client, name, wait, verbose)
+
+
+def run_implementations_query_as_string(client, name, wait=120, verbose=False):
+    return _as_string(run_implementations_query, client, name, wait, verbose)
+
+
+def run_enum_query_as_string(client, name, wait, verbose=False):
+    return _as_string(run_enum_query, client, name, wait, verbose)
+
+
+def run_switch_header_query_as_string(client, path, wait=10, verbose=False):
+    return _as_string(run_switch_header_query, client, path, wait, verbose)
+
+
+def run_includes_query_as_string(client, path, wait=10, verbose=False):
+    return _as_string(run_includes_query, client, path, wait, verbose)
+
+
+def run_rename_query_as_string(client, name, new_name, wait=120, verbose=False):
+    return _as_string(run_rename_query, client, name, new_name, wait, verbose)
 
 
 def run_search_query_as_string(client, query, kind=None,
@@ -1275,6 +1580,27 @@ def _configure_incoming(p):
     p.add_argument("name", help="function name")
 
 
+def _configure_implementations(p):
+    p.add_argument("name", help="virtual method/function name")
+
+
+def _configure_enum(p):
+    p.add_argument("name", help="enum name")
+
+
+def _configure_switch_header(p):
+    p.add_argument("path", help="file path, repo-relative or absolute")
+
+
+def _configure_includes(p):
+    p.add_argument("path", help="file path, repo-relative or absolute")
+
+
+def _configure_rename(p):
+    p.add_argument("name", help="existing symbol name (must be exact and unambiguous)")
+    p.add_argument("new_name", help="replacement identifier")
+
+
 CLI_TOOLS = {
     "struct": CliTool(
         "struct", "declaration of a struct (or typedef struct)",
@@ -1310,6 +1636,32 @@ CLI_TOOLS = {
         _configure_incoming,
         lambda a: {"name": a.name, "wait": a.wait, "verbose": a.verbose},
         run_incoming_calls_query_as_string),
+    "implementations": CliTool(
+        "implementations", "overriding definitions of a virtual method/function",
+        _configure_implementations,
+        lambda a: {"name": a.name, "wait": a.wait, "verbose": a.verbose},
+        run_implementations_query_as_string),
+    "enum": CliTool(
+        "enum", "declaration and members of an enum",
+        _configure_enum,
+        lambda a: {"name": a.name, "wait": a.wait, "verbose": a.verbose},
+        run_enum_query_as_string),
+    "switch-header": CliTool(
+        "switch-header", "the counterpart header/source file for a path",
+        _configure_switch_header,
+        lambda a: {"path": a.path, "wait": a.wait, "verbose": a.verbose},
+        run_switch_header_query_as_string),
+    "includes": CliTool(
+        "includes", "what a file includes, and what includes it (text scan)",
+        _configure_includes,
+        lambda a: {"path": a.path, "wait": a.wait, "verbose": a.verbose},
+        run_includes_query_as_string),
+    "rename": CliTool(
+        "rename", "PREVIEW ONLY: every edit site a workspace rename would touch",
+        _configure_rename,
+        lambda a: {"name": a.name, "new_name": a.new_name, "wait": a.wait,
+                   "verbose": a.verbose},
+        run_rename_query_as_string),
 }
 
 
@@ -1620,6 +1972,11 @@ HELP = ("commands:\n"
         "  outline <path> [limit]      every symbol declared in one file\n"
         "  diagnostics <path> [sev]    compiler diagnostics for one file (sev: error/warning/all)\n"
         "  hover <path> <line> <col>   type/signature/doc at a position (0-based)\n"
+        "  implementations <symbol>    overriding definitions of a virtual method/function\n"
+        "  enum <symbol>               enum declaration and members\n"
+        "  switch-header <path>        the counterpart header/source file\n"
+        "  includes <path>             what a file includes, and what includes it\n"
+        "  rename <symbol> <new_name>  PREVIEW ONLY: every edit site a rename would touch\n"
         "  help                        this message\n"
         "  quit | exit                 shut down clangd and leave")
 
@@ -1697,6 +2054,41 @@ def _repl_hover(client, parts, wait, verbose):
         client, parts[1], line, col, wait=wait, verbose=verbose))
 
 
+def _repl_implementations(client, parts, wait, verbose):
+    if len(parts) < 2:
+        print("  usage: implementations <symbol>")
+        return
+    sys.stdout.write(run_implementations_query_as_string(client, parts[1], wait, verbose=verbose))
+
+
+def _repl_enum(client, parts, wait, verbose):
+    if len(parts) < 2:
+        print("  usage: enum <symbol>")
+        return
+    sys.stdout.write(run_enum_query_as_string(client, parts[1], wait, verbose=verbose))
+
+
+def _repl_switch_header(client, parts, wait, verbose):
+    if len(parts) < 2:
+        print("  usage: switch-header <path>")
+        return
+    sys.stdout.write(run_switch_header_query_as_string(client, parts[1], wait=wait, verbose=verbose))
+
+
+def _repl_includes(client, parts, wait, verbose):
+    if len(parts) < 2:
+        print("  usage: includes <path>")
+        return
+    sys.stdout.write(run_includes_query_as_string(client, parts[1], wait=wait, verbose=verbose))
+
+
+def _repl_rename(client, parts, wait, verbose):
+    if len(parts) < 3:
+        print("  usage: rename <symbol> <new_name>")
+        return
+    sys.stdout.write(run_rename_query_as_string(client, parts[1], parts[2], wait=wait, verbose=verbose))
+
+
 # name -> (client, parts, wait, verbose) -> None, matching everything except
 # refs/callers/all (handled directly by _repl_symbol_query, since it alone
 # takes a `cmd` -- the query mode -- rather than being one fixed query).
@@ -1707,6 +2099,11 @@ REPL_TOOL_COMMANDS = {
     "outline": _repl_outline,
     "diagnostics": _repl_diagnostics,
     "hover": _repl_hover,
+    "implementations": _repl_implementations,
+    "enum": _repl_enum,
+    "switch-header": _repl_switch_header,
+    "includes": _repl_includes,
+    "rename": _repl_rename,
 }
 
 

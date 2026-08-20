@@ -42,7 +42,8 @@ ripgrep-based heuristics:
 
 ```
 clangd_query_engine.py  (CLI: refs / callers / all / struct / search / outline /
-                          diagnostics / hover / incoming; shell / daemon / stop)
+                          diagnostics / hover / incoming / implementations / enum /
+                          switch-header / includes / rename; shell / daemon / stop)
         │
         ▼
   daemon (background process, one per repo root)
@@ -112,6 +113,21 @@ the same engine, not two different feature sets.
 # Callers only, without the def/decl header lines that `callers` prints
 ./clangd_query_engine.py incoming doThing --root /path/to/repo
 
+# Overriding definitions of a virtual method/function
+./clangd_query_engine.py implementations area --root /path/to/repo
+
+# Enum declaration and members
+./clangd_query_engine.py enum LogLevel --root /path/to/repo
+
+# The counterpart header/source file for a path
+./clangd_query_engine.py switch-header src/parser.cpp --root /path/to/repo
+
+# What a file includes, and what includes it (text scan, not the index)
+./clangd_query_engine.py includes include/parser.h --root /path/to/repo
+
+# PREVIEW ONLY: every edit site a workspace rename would touch -- writes nothing
+./clangd_query_engine.py rename oldName newName --root /path/to/repo
+
 # Interactive REPL (clangd stays warm across queries in one process; all of
 # the above are available as REPL commands too -- type 'help')
 ./clangd_query_engine.py shell --root /path/to/repo
@@ -177,7 +193,12 @@ search over the codebase.
            "get_file_outline",
            "get_diagnostics",
            "get_hover_info",
-           "get_incoming_calls"
+           "get_incoming_calls",
+           "get_implementations",
+           "get_enum_info",
+           "switch_source_header",
+           "get_includes",
+           "preview_rename"
          ]
        }
      }
@@ -203,6 +224,11 @@ instance can serve queries across multiple repos — it keeps one warm
 | `get_diagnostics` | clangd's compiler errors/warnings for one file, reflecting what is on disk now |
 | `get_hover_info` | Type/signature/doc info for a symbol at a specific file position (like IDE hover) |
 | `get_incoming_calls` | All functions/methods that call a given function |
+| `get_implementations` | Overriding definitions of a virtual method/function — the complement of `get_incoming_calls` |
+| `get_enum_info` | Enum declaration location and its members |
+| `switch_source_header` | The counterpart header/source file for a path |
+| `get_includes` | What a file includes, and what includes it (best-effort text scan, not the index) |
+| `preview_rename` | **Preview only** — every edit site a workspace-wide rename would touch; never writes to disk |
 
 #### `search_symbols` — finding a name to query
 
@@ -297,3 +323,11 @@ not a re-read.
 - Outgoing call hierarchy is not exposed — clangd only supports incoming
   calls (`callers`) reliably; the tool surfaces that limitation explicitly
   rather than silently returning nothing.
+- `rename` returns a preview of every edit site clangd computed; it never
+  writes to disk — apply the listed edits yourself. It also refuses rather
+  than guesses when the name is ambiguous (an overload set) or a macro,
+  since acting on the wrong symbol is a materially worse failure than a
+  read query guessing wrong.
+- `includes` is a best-effort text scan of `#include` lines, not a query
+  against clangd's index — it does not evaluate `#ifdef`, and two files
+  sharing a basename in different directories are indistinguishable to it.
