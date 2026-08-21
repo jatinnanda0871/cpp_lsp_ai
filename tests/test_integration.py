@@ -32,6 +32,11 @@ from clangd_query_engine import (
     run_search_query_as_string,
     run_outline_query_as_string,
     run_diagnostics_query_as_string,
+    run_implementations_query_as_string,
+    run_enum_query_as_string,
+    run_switch_header_query_as_string,
+    run_includes_query_as_string,
+    run_rename_query_as_string,
 )
 
 CLANGD = support.find_clangd()
@@ -484,6 +489,129 @@ class TestStructQueries(IntegrationBase):
         self.assertNoError(out, "nonexistent struct")
         self.assertTrue(out.strip(), "produced EMPTY output")
         self.assertIn("no struct found", out)
+
+
+class TestImplementationsQueries(IntegrationBase):
+    """geo::Shape (shapes.h): area()/name() are pure virtual, directly
+    overridden by Circle, Rectangle, Triangle. Square derives from
+    Rectangle and overrides name() again -- one hop further down."""
+
+    def test_pure_virtual_with_no_definition_still_has_implementations(self):
+        out = run_implementations_query_as_string(self.client, "area", WAIT)
+        self.assertNoError(out, "Shape::area implementations")
+        for cls in ("Circle", "Rectangle", "Triangle"):
+            self.assertIn(cls, out, "missing implementation %s:\n%s" % (cls, out))
+
+    def test_direct_overrides_only_not_transitive(self):
+        """Square::name overrides Rectangle::name, not Shape::name directly
+        (Rectangle already overrides it) -- clangd's implementation search
+        from Shape::name returns its DIRECT overriders (Circle, Rectangle,
+        Triangle), not Square, which is one hop further down the hierarchy.
+        """
+        out = run_implementations_query_as_string(self.client, "name", WAIT)
+        self.assertNoError(out, "Shape::name implementations")
+        for cls in ("Circle", "Rectangle", "Triangle"):
+            self.assertIn(cls, out, "missing implementation %s:\n%s" % (cls, out))
+
+    def test_transitive_override_is_reached_one_hop_down(self):
+        """Square DOES show up as an implementation of Rectangle::name."""
+        out = run_implementations_query_as_string(self.client, "Rectangle::name", WAIT)
+        self.assertNoError(out, "Rectangle::name implementations")
+        self.assertIn("Square", out, "missing Square:\n%s" % out)
+
+    def test_nonexistent_symbol(self):
+        out = run_implementations_query_as_string(self.client, "NoSuchFn_zz", 3)
+        self.assertNoError(out, "nonexistent implementations")
+        self.assertTrue(out.strip(), "produced EMPTY output")
+
+
+class TestEnumQueries(IntegrationBase):
+    def test_enum_lists_its_members(self):
+        out = run_enum_query_as_string(self.client, "Severity", WAIT)
+        self.assertNoError(out, "Severity")
+        self.assertIn("enum decl", out)
+        for member in ("Low", "Medium", "High"):
+            self.assertIn(member, out, "missing member %s:\n%s" % (member, out))
+
+    def test_nonexistent_enum(self):
+        out = run_enum_query_as_string(self.client, "NoSuchEnum_zz", 3)
+        self.assertNoError(out, "nonexistent enum")
+        self.assertTrue(out.strip(), "produced EMPTY output")
+        self.assertIn("no enum found", out)
+
+
+class TestSwitchHeaderQueries(IntegrationBase):
+    def test_header_to_source_round_trip(self):
+        header = support.corpus_source("include/shapes.h")
+        out = run_switch_header_query_as_string(self.client, header, wait=WAIT)
+        self.assertNoError(out, "shapes.h -> source")
+        self.assertIn("shapes.cpp", out)
+
+        src = support.corpus_source("src/shapes.cpp")
+        out = run_switch_header_query_as_string(self.client, src, wait=WAIT)
+        self.assertNoError(out, "shapes.cpp -> header")
+        self.assertIn("shapes.h", out)
+
+    def test_missing_file_reports_clearly(self):
+        out = run_switch_header_query_as_string(
+            self.client, support.corpus_source("src/does_not_exist.cpp"), wait=5)
+        self.assertNoError(out, "switch-header missing file")
+        self.assertTrue(out.strip(), "produced EMPTY output")
+
+
+class TestIncludesQueries(IntegrationBase):
+    """Pure text scan (see ClangdClient.list_includes/find_includers), so
+    these don't need the index warm -- clangd is only used as the
+    already-shared client, not queried."""
+
+    def test_includes_of_shapes_h(self):
+        out = run_includes_query_as_string(
+            self.client, support.corpus_source("include/shapes.h"), wait=5)
+        self.assertNoError(out, "includes of shapes.h")
+        self.assertIn("prelude.h", out)
+
+    def test_included_by_shapes_h(self):
+        out = run_includes_query_as_string(
+            self.client, support.corpus_source("include/shapes.h"), wait=5)
+        self.assertNoError(out, "included-by shapes.h")
+        self.assertIn("shapes.cpp", out)
+
+    def test_missing_file_reports_clearly(self):
+        out = run_includes_query_as_string(
+            self.client, support.corpus_source("include/does_not_exist.h"), wait=5)
+        self.assertNoError(out, "includes missing file")
+        self.assertTrue(out.strip(), "produced EMPTY output")
+
+
+class TestRenameQueries(IntegrationBase):
+    def test_known_edit_count(self):
+        """Backend::process (chains.h/.cpp) has exactly 3 callers plus its
+        own declaration and definition, so a rename touches all of them."""
+        out = run_rename_query_as_string(self.client, "process", "renamedProcess", WAIT)
+        self.assertNoError(out, "rename process")
+        self.assertIn("PREVIEW ONLY", out)
+        m = re.search(r"(\d+) edits? across", out)
+        self.assertIsNotNone(m, "no edit count reported:\n%s" % out)
+        self.assertGreaterEqual(int(m.group(1)), 4,
+                                "expected >=4 edit sites for Backend::process:\n%s" % out)
+
+    def test_ambiguous_overload_is_refused(self):
+        """Calculator::add is an overload set -- rename must refuse rather
+        than guess which one the caller meant."""
+        out = run_rename_query_as_string(self.client, "add", "renamedAdd", WAIT)
+        self.assertNoError(out, "rename add")
+        self.assertIn("ambiguous", out)
+        self.assertNotIn("PREVIEW ONLY", out)
+
+    def test_invalid_new_name_is_rejected(self):
+        out = run_rename_query_as_string(self.client, "process", "123bad", WAIT)
+        self.assertNoError(out, "rename invalid new_name")
+        self.assertIn("not a valid C++ identifier", out)
+
+    def test_nonexistent_symbol(self):
+        out = run_rename_query_as_string(self.client, "NoSuchFn_zz", "y", 3)
+        self.assertNoError(out, "rename nonexistent")
+        self.assertTrue(out.strip(), "produced EMPTY output")
 
 
 class TestHoverQueries(IntegrationBase):

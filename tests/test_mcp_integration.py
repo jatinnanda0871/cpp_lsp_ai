@@ -87,11 +87,17 @@ class TestMcpToolsEndToEnd(unittest.TestCase):
                   path=support.corpus_source("src/big.cpp"),
                   line=support.line_of("src/big.cpp", "int BigService::runPipeline"),
                   col=len("int BigService::"))
+        self.call("get_implementations", name="area")
+        self.call("get_enum_info", name="Severity")
+        self.call("switch_source_header", path=support.corpus_source("src/shapes.cpp"))
+        self.call("get_includes", path=support.corpus_source("include/shapes.h"))
+        self.call("preview_rename", name="process", new_name="renamedProcess")
 
     def test_every_tool_handles_a_missing_symbol(self):
         for tool, key in (("get_function_info", "name"), ("get_class_info", "name"),
                           ("get_macro_info", "name"), ("get_struct_info", "name"),
-                          ("get_incoming_calls", "name")):
+                          ("get_incoming_calls", "name"),
+                          ("get_implementations", "name"), ("get_enum_info", "name")):
             out = self.call(tool, **{key: "NoSuchThing_zzz"})
             self.assertTrue(len(out) > 10, "%s gave a uselessly terse answer: %r" % (tool, out))
 
@@ -156,6 +162,11 @@ class TestConcurrentToolCalls(unittest.TestCase):
             ("get_incoming_calls", {"name": "process"}),
             ("get_incoming_calls", {"name": "validate"}),
             ("get_function_info", {"name": "tinyOne"}),
+            ("get_implementations", {"name": "area"}),
+            ("get_enum_info", {"name": "Severity"}),
+            ("switch_source_header", {"path": support.corpus_source("src/shapes.cpp")}),
+            ("get_includes", {"path": support.corpus_source("include/shapes.h")}),
+            ("preview_rename", {"name": "process", "new_name": "renamedProcess"}),
         ]
         results, errors = {}, []
 

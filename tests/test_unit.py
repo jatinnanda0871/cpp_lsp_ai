@@ -443,6 +443,81 @@ class TestMacroDefinitionScan(unittest.TestCase):
                         "matched a usage site instead of the definition: %s" % found)
 
 
+class TestIncludeGraphScan(unittest.TestCase):
+    """list_includes/find_includers are a pure text scan (see
+    find_macro_definition_file above for the same tradeoff) -- no clangd
+    needed, so these run against the real fixture corpus directly."""
+
+    def setUp(self):
+        self.client = blank_client()
+        self.client.root = support.CORPUS_DIR
+
+    def test_list_includes_of_a_known_file(self):
+        shapes_h = support.corpus_source("include/shapes.h")
+        includes = self.client.list_includes(shapes_h)
+        self.assertIn(("prelude.h", False), includes,
+                      "missing prelude.h in %r" % (includes,))
+
+    def test_list_includes_distinguishes_system_from_quoted(self):
+        path = os.path.join(support.TESTS_DIR, "_tmp_includes_test.h")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('#include <vector>\n#include "local.h"\n// #include "commented.h"\n')
+        try:
+            includes = self.client.list_includes(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(includes, [("vector", True), ("local.h", False)])
+
+    def test_find_includers_of_a_known_file(self):
+        shapes_h = support.corpus_source("include/shapes.h")
+        includers = self.client.find_includers(shapes_h)
+        found = [os.path.basename(p) for p, _line in includers]
+        self.assertIn("shapes.cpp", found, "shapes.cpp does not include shapes.h in %r" % (found,))
+
+    def test_find_includers_excludes_the_file_itself(self):
+        prelude_h = support.corpus_source("include/prelude.h")
+        includers = self.client.find_includers(prelude_h)
+        for path, _line in includers:
+            self.assertNotEqual(os.path.normpath(path), os.path.normpath(prelude_h))
+
+    def test_list_includes_on_unreadable_file_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.client.list_includes(os.path.join(support.TESTS_DIR, "no_such_file_zz.h"))
+
+
+class TestRenameEditGrouping(unittest.TestCase):
+    """_rename_edits_by_file must handle both WorkspaceEdit shapes clangd can
+    send back -- only one is ever populated per reply."""
+
+    def test_changes_shape(self):
+        edit = {"changes": {"file:///a/b.cpp": [{"range": {"start": {"line": 0, "character": 0}}}]}}
+        by_file = qe._rename_edits_by_file(edit)
+        self.assertEqual(len(by_file), 1)
+        [(path, edits)] = by_file.items()
+        self.assertTrue(path.endswith("b.cpp"), path)
+        self.assertEqual(len(edits), 1)
+
+    def test_document_changes_shape(self):
+        edit = {"documentChanges": [
+            {"textDocument": {"uri": "file:///a/b.cpp", "version": 1},
+             "edits": [{"range": {"start": {"line": 1, "character": 2}}}]},
+        ]}
+        by_file = qe._rename_edits_by_file(edit)
+        self.assertEqual(len(by_file), 1)
+        [(path, edits)] = by_file.items()
+        self.assertTrue(path.endswith("b.cpp"), path)
+        self.assertEqual(len(edits), 1)
+
+    def test_empty_edit_produces_no_files(self):
+        self.assertEqual(qe._rename_edits_by_file({}), {})
+
+    def test_identifier_validation(self):
+        for good in ("x", "_x", "camelCase", "Snake_Case9"):
+            self.assertIsNotNone(qe._IDENTIFIER_RE.match(good), good)
+        for bad in ("9x", "has space", "has-dash", "", "a.b"):
+            self.assertIsNone(qe._IDENTIFIER_RE.match(bad), bad)
+
+
 class TestClientLifecycle(unittest.TestCase):
     def test_is_alive(self):
         c = ClangdClient.__new__(ClangdClient)
@@ -687,7 +762,7 @@ class TestCliToolsRegistry(unittest.TestCase):
         instead, for every registered tool at once."""
         import inspect
         common = types.SimpleNamespace(
-            name="X", query="X", path="a.cpp", line=1, col=2,
+            name="X", new_name="Y", query="X", path="a.cpp", line=1, col=2,
             kind=None, limit=10, severity="all", wait=5, verbose=False)
         for name, tool in qe.CLI_TOOLS.items():
             with self.subTest(name):

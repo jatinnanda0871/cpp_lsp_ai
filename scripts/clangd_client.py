@@ -17,6 +17,7 @@ import re
 import threading
 import subprocess
 import pathlib
+from urllib.parse import urlparse, unquote
 
 # ============================ tunables ============================
 # Once workspace/symbol has answered anything the index is serving, so a
@@ -246,6 +247,8 @@ class ClangdClient:
                     "callHierarchy": {"dynamicRegistration": False},
                     "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
                     "publishDiagnostics": {"relatedInformation": False},
+                    "implementation": {},
+                    "rename": {"prepareSupport": False},
                 },
                 "window": {"workDoneProgress": True},
             },
@@ -476,6 +479,35 @@ class ClangdClient:
             })
         return out
 
+    def get_enum_end_and_members(self, path, enum_start):
+        """Same shape as get_class_end_and_methods, but for an enum's
+        members instead of a class's methods.
+
+        No kind filter on the children: verified against a live clangd
+        (22.1.6), which reports enum MEMBERS with kind=10 (Enum), the same
+        kind as the enum itself, not kind=22 (EnumMember) the LSP spec
+        defines -- same "clangd vs the spec" gap as SYMBOL_KIND_NAMES
+        documents for struct/macro. An enum node's children are its
+        enumerators and nothing else, so no filter is needed anyway.
+        """
+        symbols = self.document_symbol(path)
+        enum_node = self._find_node_by_range_start(symbols, enum_start)
+        if enum_node is None:
+            return None, []
+        end_line = ((enum_node.get("range") or {}).get("end") or {}).get("line")
+        members = []
+        for child in enum_node.get("children") or []:
+            sel = child.get("selectionRange") or child.get("range") or {}
+            start = sel.get("start") or {}
+            members.append({
+                "name": child.get("name"),
+                "line": start.get("line") or 0,
+                # clangd does not always fill this in (e.g. an implicit
+                # value with no initializer); pass through as-is.
+                "detail": child.get("detail", ""),
+            })
+        return end_line, members
+
     def get_class_end_and_methods(self, path, class_start):
         """Single documentSymbol fetch for both the class end line and its
         methods, instead of two separate calls that each re-fetch the same
@@ -555,6 +587,53 @@ class ClangdClient:
     def incoming_async(self, item):
         return self._request_async("callHierarchy/incomingCalls", {"item": item})
 
+    def implementation_async(self, path, line, col):
+        """Resolve overriding definitions of the virtual method/function at
+        a position. Returns a handle for Location[] (bare locations, no
+        symbol name -- see run_implementations_query for name resolution)."""
+        uri = self.did_open(path)
+        return self._request_async("textDocument/implementation", {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+        })
+
+    def switch_source_header(self, path, timeout=None):
+        """The counterpart header/source file for `path` (clangd extension).
+        Returns an absolute path, or None if clangd has no counterpart.
+
+        Unlike every other textDocument/* request here, clangd's params for
+        this one are a bare TextDocumentIdentifier ({"uri": ...}), not
+        wrapped in a "textDocument" field -- confirmed against a live
+        clangd, which rejects the wrapped form with -32602.
+        """
+        uri = self.did_open(path)
+        result = self._request("textDocument/switchSourceHeader", {
+            "uri": uri,
+        }, timeout=timeout)
+        if not result:
+            return None
+        return self._path_from_uri(result)
+
+    @staticmethod
+    def _path_from_uri(uri):
+        """file:// URI -> absolute path. Self-contained (not imported from
+        clangd_query_engine.uri_to_path) to avoid a circular import -- this
+        module has no dependency on the engine module."""
+        p = unquote(urlparse(uri).path)
+        if os.name == "nt" and len(p) >= 3 and p[0] == "/" and p[2] == ":":
+            p = p[1:]
+        return os.path.normpath(p) if p else p
+
+    def rename_async(self, path, line, col, new_name):
+        """Compute (but do not apply) a workspace rename. Returns a handle
+        for a WorkspaceEdit."""
+        uri = self.did_open(path)
+        return self._request_async("textDocument/rename", {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+            "newName": new_name,
+        })
+
     # ---- hover queries --------------------------------------------------------
     def hover(self, path, line, col, timeout=None):
         """Get hover information for a symbol at the given position.
@@ -593,6 +672,79 @@ class ClangdClient:
             if self.log:
                 sys.stderr.write("[clangq] no struct match yet, index warming (retry %d)...\n" % attempt)
             time.sleep(interval_s)
+
+    def resolve_enum(self, name, deadline_s=10, interval_s=2):
+        """Resolve an enum name via clangd's workspace/symbol index.
+        Returns SymbolInformation[] with kind=10 (Enum)."""
+        import time
+        if getattr(self, "_index_warm", False):
+            deadline_s = min(deadline_s, WARM_MISS_DEADLINE_S)
+        end = time.time() + deadline_s
+        attempt = 0
+        while True:
+            syms = self.workspace_symbol(name)
+            enums = [s for s in syms if s.get("kind") == 10]
+            if enums:
+                return enums
+            if time.time() >= end:
+                return []
+            attempt += 1
+            if self.log:
+                sys.stderr.write("[clangq] no enum match yet, index warming (retry %d)...\n" % attempt)
+            time.sleep(interval_s)
+
+    # ---- include-graph queries --------------------------------------------
+    # Pure filesystem text scan -- deliberately NOT a clangd request. clangd
+    # has no "who includes this file" query, and even "what does this file
+    # include" would need the file open; scanning the raw text works without
+    # a warm index at all, same tradeoff as find_macro_definition_file below.
+    # Best-effort: does not evaluate #ifdef, and a shared basename in two
+    # directories is ambiguous -- both are called out in the caller's output.
+    _INCLUDE_RE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]')
+
+    def list_includes(self, path):
+        """#include lines spelled in `path` itself, as-is (not resolved to
+        absolute paths). Returns [(spelling, is_system)]."""
+        out = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = self._INCLUDE_RE.match(line)
+                    if m:
+                        out.append((m.group(2), m.group(1) == "<"))
+        except OSError as e:
+            raise RuntimeError("cannot read %r: %s" % (path, e))
+        return out
+
+    def find_includers(self, path):
+        """Files under the repo root whose #include spelling matches
+        os.path.basename(path). Same scan bounds as find_macro_definition_file."""
+        target = os.path.basename(path)
+        out = []
+        scanned = 0
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in MACRO_SCAN_SKIP_DIRS and not d.startswith(".")]
+            for fn in filenames:
+                if not fn.endswith(MACRO_SCAN_EXTS):
+                    continue
+                scanned += 1
+                if scanned > MACRO_SCAN_MAX_FILES:
+                    return out
+                full = os.path.join(dirpath, fn)
+                if os.path.normpath(full) == os.path.normpath(path):
+                    continue
+                try:
+                    if os.path.getsize(full) > MACRO_SCAN_MAX_BYTES:
+                        continue
+                    with open(full, "r", encoding="utf-8", errors="replace") as f:
+                        for lineno, line in enumerate(f, start=1):
+                            m = self._INCLUDE_RE.match(line)
+                            if m and os.path.basename(m.group(2)) == target:
+                                out.append((full, lineno))
+                except OSError:
+                    continue
+        return out
 
     # ---- macro queries --------------------------------------------------------
     def find_macro_definition_file(self, name):

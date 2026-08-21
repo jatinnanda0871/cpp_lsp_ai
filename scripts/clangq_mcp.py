@@ -10,6 +10,7 @@ cannot drift apart.
 import asyncio
 import atexit
 import os
+import re
 import sys
 import threading
 import time
@@ -29,6 +30,11 @@ from clangd_query_engine import (
     run_search_query_as_string,
     run_outline_query_as_string,
     run_diagnostics_query_as_string,
+    run_implementations_query_as_string,
+    run_enum_query_as_string,
+    run_switch_header_query_as_string,
+    run_includes_query_as_string,
+    run_rename_query_as_string,
     SEARCH_KIND_FILTERS,
     DEFAULT_SEARCH_LIMIT,
     MAX_SEARCH_LIMIT,
@@ -363,6 +369,18 @@ def _validate_severity(label, value):
     return None
 
 
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_]\w*$")
+
+
+def _validate_identifier(label, value):
+    """Checked before clangd sees it, same reasoning as the other
+    pre-validators: a bad new_name should fail with a clear message, not a
+    bare -32602 or a silently-wrong rename target."""
+    if not isinstance(value, str) or not _IDENTIFIER_RE.match(value):
+        return "Error: %s must be a valid C++ identifier, got %r" % (label, value)
+    return None
+
+
 def _validate_outline_limit(label, value):
     if isinstance(value, bool) or not isinstance(value, int):
         return "Error: %s must be an integer, got %s (%r)" % (
@@ -419,6 +437,11 @@ COL = Param(
     "col",
     {"type": "integer", "description": "Column number, 0-based"},
     validate=_validate_position, hint="a 0-based integer column number",
+)
+NEW_NAME = Param(
+    "new_name",
+    {"type": "string", "description": "Replacement identifier for rename"},
+    validate=_validate_identifier, hint="a valid C++ identifier",
 )
 SEARCH_QUERY = Param(
     "query",
@@ -607,6 +630,61 @@ def _get_hover_info(client, args):
 )
 def _get_incoming_calls(client, args):
     return run_incoming_calls_query_as_string(client, args["name"], QUERY_WAIT_S)
+
+
+@_tool(
+    "get_implementations",
+    "Get every overriding definition of a virtual method or pure virtual "
+    "function -- the complement of get_incoming_calls: that tool answers "
+    "'who calls this', this one answers 'who implements this'.",
+    [ROOT, SYMBOL],
+)
+def _get_implementations(client, args):
+    return run_implementations_query_as_string(client, args["name"], QUERY_WAIT_S)
+
+
+@_tool(
+    "get_enum_info",
+    "Get the declaration location and members of a C/C++ enum (plain or "
+    "'enum class'), including each member's value where clangd reports one.",
+    [ROOT, SYMBOL],
+)
+def _get_enum_info(client, args):
+    return run_enum_query_as_string(client, args["name"], QUERY_WAIT_S)
+
+
+@_tool(
+    "switch_source_header",
+    "Get the counterpart header/source file for a path, e.g. src/parser.cpp "
+    "-> include/parser.h. Use this instead of guessing filenames.",
+    [ROOT, PATH],
+)
+def _switch_source_header(client, args):
+    return run_switch_header_query_as_string(client, args["path"], wait=HOVER_WAIT_S)
+
+
+@_tool(
+    "get_includes",
+    "Get what a file includes, and what includes it. Best-effort text scan "
+    "of #include lines (not clangd's index), so it does not evaluate "
+    "#ifdef and two files sharing a basename in different directories are "
+    "indistinguishable. Use it to gauge the blast radius of a header change.",
+    [ROOT, PATH],
+)
+def _get_includes(client, args):
+    return run_includes_query_as_string(client, args["path"], wait=HOVER_WAIT_S)
+
+
+@_tool(
+    "preview_rename",
+    "PREVIEW a workspace-wide rename of a C/C++ symbol: returns every edit "
+    "site clangd computed (file, line, column). Does NOT modify any file -- "
+    "apply the listed edits yourself (e.g. with your own file-editing tool). "
+    "Refuses ambiguous names (overload sets) and macros rather than guessing.",
+    [ROOT, SYMBOL, NEW_NAME],
+)
+def _preview_rename(client, args):
+    return run_rename_query_as_string(client, args["name"], args["new_name"], QUERY_WAIT_S)
 
 
 # ============================== dispatch ==============================

@@ -70,9 +70,29 @@ class TestArgumentHandling(unittest.TestCase):
 
     def test_missing_name_for_each_symbol_tool(self):
         for tool in ("get_function_info", "get_class_info", "get_macro_info",
-                     "get_struct_info", "get_incoming_calls"):
+                     "get_struct_info", "get_incoming_calls",
+                     "get_implementations", "get_enum_info"):
             out = clangq_mcp._run_tool(tool, {"root": self.root})
             self.assertIn("name is required", out, "%s: %s" % (tool, out))
+
+    def test_switch_header_and_includes_require_a_path(self):
+        for tool in ("switch_source_header", "get_includes"):
+            out = clangq_mcp._run_tool(tool, {"root": self.root})
+            self.assertIn("path is required", out, "%s: %s" % (tool, out))
+
+    def test_preview_rename_requires_name_and_new_name(self):
+        out = clangq_mcp._run_tool("preview_rename", {"root": self.root, "new_name": "y"})
+        self.assertIn("name is required", out)
+        out = clangq_mcp._run_tool("preview_rename", {"root": self.root, "name": "x"})
+        self.assertIn("new_name is required", out)
+
+    def test_preview_rename_rejects_a_non_identifier_new_name(self):
+        for bad in ("123abc", "has space", "has-dash", "", "  "):
+            out = clangq_mcp._run_tool(
+                "preview_rename", {"root": self.root, "name": "x", "new_name": bad})
+            self.assertTrue(
+                "new_name is required" in out or "must be a valid C++ identifier" in out,
+                "new_name=%r: %s" % (bad, out))
 
     def test_null_name_is_rejected(self):
         out = clangq_mcp._run_tool("get_class_info", {"root": self.root, "name": None})
@@ -169,6 +189,18 @@ class TestArgumentHandling(unittest.TestCase):
         self.assertEqual(spec.inputSchema["required"], ["root", "query"])
         self.assertEqual(sorted(spec.inputSchema["properties"]["kind"]["enum"]),
                          sorted(clangq_mcp.SEARCH_KIND_FILTERS))
+
+    def test_new_tools_are_advertised_with_the_right_required_params(self):
+        cases = {
+            "get_implementations": ["root", "name"],
+            "get_enum_info": ["root", "name"],
+            "switch_source_header": ["root", "path"],
+            "get_includes": ["root", "path"],
+            "preview_rename": ["root", "name", "new_name"],
+        }
+        for tool_name, required in cases.items():
+            spec = clangq_mcp.TOOLS[tool_name].as_mcp_tool()
+            self.assertEqual(spec.inputSchema["required"], required, tool_name)
 
 
 @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed: %s" % MCP_IMPORT_ERROR)
@@ -478,6 +510,11 @@ class TestCliMatchesMcpFeatureSet(unittest.TestCase):
         "get_diagnostics": ("diagnostics", "run_diagnostics_query_as_string"),
         "get_hover_info": ("hover", "run_hover_query_as_string"),
         "get_incoming_calls": ("incoming", "run_incoming_calls_query_as_string"),
+        "get_implementations": ("implementations", "run_implementations_query_as_string"),
+        "get_enum_info": ("enum", "run_enum_query_as_string"),
+        "switch_source_header": ("switch-header", "run_switch_header_query_as_string"),
+        "get_includes": ("includes", "run_includes_query_as_string"),
+        "preview_rename": ("rename", "run_rename_query_as_string"),
     }
 
     def test_every_mcp_tool_has_a_cli_equivalent(self):
